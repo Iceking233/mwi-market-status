@@ -7,3 +7,4 @@ A private project for building my own Milky Way Idle market data pipeline.
 - local backend plan
 - SQLite historical storage
 - future realtime order book ingestion
+- static shard pipeline for importing extra history from `market.db`

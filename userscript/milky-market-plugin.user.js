@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         mooket ultra local test
 // @namespace    local.mooket.ultra.test
-// @version      20260314.1
+// @version      20260327
 // @description  银河奶牛历史价格（本地测试版）
-// @author       IOMisaka + Iceking233 + Jacky
+// @author       IOMisaka + Iceking233
 // @match        https://www.milkywayidle.com/*
 // @match        https://www.milkywayidlecn.com/*
 // @icon         https://www.milkywayidle.com/favicon.svg
@@ -32,7 +32,7 @@
   let mwi = {//供外部调用的接口
     //由于脚本加载问题，注入有可能失败
     //修改了hookCallback，添加了回调前和回调后处理
-    version: "0.7.0",//版本号，未改动原有接口只更新最后一个版本号，更改了接口会更改次版本号，主版本暂时不更新，等稳定之后再考虑主版本号更新
+    version: "0.7.1",//版本号，未改动原有接口只更新最后一个版本号，更改了接口会更改次版本号，主版本暂时不更新，等稳定之后再考虑主版本号更新
     MWICoreInitialized: false,//是否初始化完成，完成会还会通过window发送一个自定义事件 MWICoreInitialized
     game: null,//注入游戏对象，可以直接访问游戏中的大量数据和方法以及消息事件等
     lang: null,//语言翻译, 例如中文物品lang.zh.translation.itemNames['/items/coin']
@@ -2346,7 +2346,323 @@
   }
   /*实时市场模块*/
   const HOST = "https://mooket.qi-e.top";
-  const MWIAPI_URL = "https://www.milkywayidle.com/game_data/marketplace.json";
+  const MWIAPI_URL = `${HOST}/market/api.json`;
+  const THIRD_PARTY_HISTORY_URL = "https://q7.nainai.eu.org/api/market/history";
+  const SQLITE_HISTORY_MANIFEST_URL = `${HOST}/market/history/sqlite/manifest.json`;
+  const HISTORY_DB_NAME = "MWIHistoryDB";
+  const HISTORY_DB_VERSION = 1;
+  const THIRD_PARTY_MAX_DAYS = 18;
+  const FULL_PRELOAD_DAYS = THIRD_PARTY_MAX_DAYS;
+  const SQLITE_HISTORY_MANIFEST_TTL = 6 * 3600 * 1000;
+  const SQLITE_HISTORY_IMPORT_MIN_DAYS = 20;
+  const sqliteHistoryManifestState = {
+    value: null,
+    fetchedAt: 0,
+    inflight: null
+  };
+
+  class MarketHistoryStore {
+    dbPromise = null;
+    init() {
+      if (this.dbPromise) return this.dbPromise;
+      this.dbPromise = new Promise((resolve, reject) => {
+        const request = indexedDB.open(HISTORY_DB_NAME, HISTORY_DB_VERSION);
+        request.onupgradeneeded = () => {
+          const db = request.result;
+          if (!db.objectStoreNames.contains("history_points")) {
+            const store = db.createObjectStore("history_points", { keyPath: "id" });
+            store.createIndex("item_variant_time", ["itemHrid", "variant", "time"], { unique: false });
+            store.createIndex("time", "time", { unique: false });
+            store.createIndex("source", "source", { unique: false });
+          }
+          if (!db.objectStoreNames.contains("meta")) {
+            db.createObjectStore("meta", { keyPath: "key" });
+          }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      }).catch(error => {
+        console.error("IndexedDB init failed", error);
+        return null;
+      });
+      return this.dbPromise;
+    }
+    async setMeta(key, value) {
+      const db = await this.init();
+      if (!db) return;
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction("meta", "readwrite");
+        tx.objectStore("meta").put({ key, value });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      }).catch(error => console.warn("setMeta failed", key, error));
+    }
+    async getMeta(key) {
+      const db = await this.init();
+      if (!db) return null;
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction("meta", "readonly");
+        const request = tx.objectStore("meta").get(key);
+        request.onsuccess = () => resolve(request.result?.value ?? null);
+        request.onerror = () => reject(request.error);
+      }).catch(error => {
+        console.warn("getMeta failed", key, error);
+        return null;
+      });
+    }
+    normalizePoint(itemHrid, variant, time, point, source = "official_hourly") {
+      const safeTime = Number(time) || 0;
+      const safeVariant = Number(variant) || 0;
+      const rawAsk = point.a ?? point.ask ?? -1;
+      const rawBid = point.b ?? point.bid ?? -1;
+      const rawPrice = point.p ?? point.price ?? null;
+      const rawVolume = point.v ?? point.volume ?? null;
+      return {
+        id: `${itemHrid}:${safeVariant}:${safeTime}:${source}`,
+        itemHrid,
+        variant: safeVariant,
+        time: safeTime,
+        ask: rawAsk == null ? null : Number(rawAsk),
+        bid: rawBid == null ? null : Number(rawBid),
+        price: rawPrice == null ? null : Number(rawPrice),
+        volume: rawVolume == null ? null : Number(rawVolume),
+        source,
+        importedAt: Math.floor(Date.now() / 1000)
+      };
+    }
+    async saveOfficialSnapshot(snapshot) {
+      if (!snapshot?.marketData || !snapshot?.timestamp) return 0;
+      const db = await this.init();
+      if (!db) return 0;
+
+      const source = "official_hourly";
+      const alreadyImportedTimestamp = await this.getMeta("officialLastSnapshotTimestamp");
+      if (Number(alreadyImportedTimestamp) === Number(snapshot.timestamp)) return 0;
+
+      const records = [];
+      Object.entries(snapshot.marketData).forEach(([itemName, variants]) => {
+        const itemHrid = mwi.ensureItemHrid(itemName) || itemName;
+        if (!itemHrid?.startsWith("/items/")) return;
+        Object.entries(variants || {}).forEach(([variant, point]) => {
+          records.push(this.normalizePoint(itemHrid, variant, snapshot.timestamp, point || {}, source));
+        });
+      });
+      if (!records.length) return 0;
+
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction("history_points", "readwrite");
+        const store = tx.objectStore("history_points");
+        records.forEach(record => { store.put(record); });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      }).catch(error => {
+        console.error("saveOfficialSnapshot failed", error);
+      });
+
+      await this.setMeta("officialLastSnapshotTimestamp", Number(snapshot.timestamp));
+      await this.setMeta("officialLastImportedAt", Math.floor(Date.now() / 1000));
+      return records.length;
+    }
+    async saveHistorySeries(itemHrid, variant, rows, source = "third_party_history", options = {}) {
+      if (!itemHrid || !Array.isArray(rows) || rows.length === 0) return 0;
+      const db = await this.init();
+      if (!db) return 0;
+      const coverageDays = Number(options.days || 0) || 0;
+      const records = rows
+        .filter(row => row && Number(row.time) > 0)
+        .map(row => this.normalizePoint(itemHrid, variant, row.time, row, source));
+      if (!records.length) return 0;
+
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction("history_points", "readwrite");
+        const store = tx.objectStore("history_points");
+        records.forEach(record => { store.put(record); });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      }).catch(error => {
+        console.error("saveHistorySeries failed", itemHrid, variant, source, error);
+      });
+
+      await this.setMeta(`history:${source}:${itemHrid}:${Number(variant) || 0}`, {
+        importedAt: Math.floor(Date.now() / 1000),
+        rows: records.length,
+        days: coverageDays,
+        earliestTime: records[0]?.time || null,
+        latestTime: records[records.length - 1]?.time || null
+      });
+      return records.length;
+    }
+    async queryHistory(itemHrid, variant = 0, days = 1) {
+      const db = await this.init();
+      if (!db || !itemHrid) return [];
+      const variantNumber = Number(variant) || 0;
+      const minTime = Math.floor(Date.now() / 1000) - Number(days || 1) * 86400;
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction("history_points", "readonly");
+        const index = tx.objectStore("history_points").index("item_variant_time");
+        const range = IDBKeyRange.bound([itemHrid, variantNumber, minTime], [itemHrid, variantNumber, Number.MAX_SAFE_INTEGER]);
+        const request = index.getAll(range);
+        request.onsuccess = () => {
+          const rows = (request.result || []).sort((a, b) => a.time - b.time);
+          resolve(rows);
+        };
+        request.onerror = () => reject(request.error);
+      }).catch(error => {
+        console.error("queryHistory failed", itemHrid, variant, error);
+        return [];
+      });
+    }
+    hasCoverage(rows, days = 1) {
+      if (!Array.isArray(rows) || rows.length < 2) return false;
+      const minTime = Math.floor(Date.now() / 1000) - Number(days || 1) * 86400;
+      const earliest = Number(rows[0]?.time || 0);
+      if (!earliest) return false;
+      const tolerance = Math.min(6 * 3600, Math.max(3600, Number(days || 1) * 1800));
+      return earliest <= minTime + tolerance;
+    }
+    async getHistoryStats(itemHrid, variant = 0, days = 1) {
+      const db = await this.init();
+      if (!db || !itemHrid) return { cachedDays: 0, cachedVolumeDays: 0, totalPoints: 0, earliestTime: null, latestTime: null };
+      const variantNumber = Number(variant) || 0;
+      const minTime = Math.floor(Date.now() / 1000) - Number(days || 1) * 86400;
+      const countContinuousDays = (rows) => {
+        const sortedDays = [...new Set(rows.map(row => {
+          const d = new Date(Number(row.time || 0) * 1000);
+          return Math.floor(new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() / 86400000);
+        }))].sort((a, b) => a - b);
+        if (!sortedDays.length) return 0;
+        let count = 1;
+        for (let i = sortedDays.length - 1; i > 0; i--) {
+          if (sortedDays[i] - sortedDays[i - 1] <= 1) count += 1;
+          else break;
+        }
+        return count;
+      };
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction("history_points", "readonly");
+        const index = tx.objectStore("history_points").index("item_variant_time");
+        const range = IDBKeyRange.bound([itemHrid, variantNumber, minTime], [itemHrid, variantNumber, Number.MAX_SAFE_INTEGER]);
+        const request = index.getAll(range);
+        request.onsuccess = () => {
+          const rows = (request.result || []).sort((a, b) => a.time - b.time);
+          const historicalVolumeRows = rows.filter(row =>
+            row.volume != null &&
+            Number(row.volume) >= 0 &&
+            row.source !== "official_hourly"
+          );
+          resolve({
+            cachedDays: countContinuousDays(rows),
+            cachedVolumeDays: Math.min(THIRD_PARTY_MAX_DAYS, countContinuousDays(historicalVolumeRows)),
+            totalPoints: rows.length,
+            earliestTime: rows[0]?.time ?? null,
+            latestTime: rows[rows.length - 1]?.time ?? null
+          });
+        };
+        request.onerror = () => reject(request.error);
+      }).catch(error => {
+        console.error("getHistoryStats failed", itemHrid, variant, error);
+        return { cachedDays: 0, cachedVolumeDays: 0, totalPoints: 0, earliestTime: null, latestTime: null };
+      });
+    }
+    toChartData(rows, stats = null, day = 1) {
+      const pointsByTime = new Map();
+      const sortedRows = [...(rows || [])].sort((a, b) => a.time - b.time);
+
+      sortedRows.forEach(row => {
+        const time = Number(row.time) || 0;
+        if (!time) return;
+        const point = pointsByTime.get(time) || {
+          time,
+          bid: null,
+          ask: null,
+          volume: null
+        };
+        if (Number.isFinite(Number(row.bid)) && Number(row.bid) >= 0) point.bid = Number(row.bid);
+        if (Number.isFinite(Number(row.ask)) && Number(row.ask) >= 0) point.ask = Number(row.ask);
+        if (row.volume != null && Number.isFinite(Number(row.volume)) && Number(row.volume) >= 0) {
+          point.volume = point.volume == null ? Number(row.volume) : Math.max(point.volume, Number(row.volume));
+        }
+        pointsByTime.set(time, point);
+      });
+
+      const bucketSeconds = Number(day) <= 3 ? 3600 : Number(day) <= 20 ? 14400 : 86400;
+      const bucketMap = new Map();
+      Array.from(pointsByTime.values()).forEach(point => {
+        const bucketTime = Math.floor(point.time / bucketSeconds) * bucketSeconds;
+        const bucket = bucketMap.get(bucketTime) || {
+          time: bucketTime,
+          bid: null,
+          ask: null,
+          volume: null
+        };
+        if (point.bid != null) bucket.bid = point.bid;
+        if (point.ask != null) bucket.ask = point.ask;
+        if (point.volume != null) bucket.volume = (bucket.volume ?? 0) + point.volume;
+        bucketMap.set(bucketTime, bucket);
+      });
+
+      const bid = [];
+      const ask = [];
+      Array.from(bucketMap.values()).sort((a, b) => a.time - b.time).forEach(point => {
+        bid.push({ time: point.time, price: point.bid, volume: point.volume });
+        ask.push({ time: point.time, price: point.ask, volume: point.volume });
+      });
+      return { bid, ask, source: "indexeddb", stats };
+    }
+  }
+  const marketHistoryStore = new MarketHistoryStore();
+
+  function toAbsoluteUrl(pathOrUrl, baseUrl = SQLITE_HISTORY_MANIFEST_URL) {
+    try {
+      return new URL(pathOrUrl, baseUrl).toString();
+    } catch {
+      return pathOrUrl;
+    }
+  }
+
+  async function fetchSqliteHistoryManifest(signal) {
+    if (
+      sqliteHistoryManifestState.value &&
+      Date.now() - sqliteHistoryManifestState.fetchedAt < SQLITE_HISTORY_MANIFEST_TTL
+    ) {
+      return sqliteHistoryManifestState.value;
+    }
+    if (sqliteHistoryManifestState.inflight) {
+      return sqliteHistoryManifestState.inflight;
+    }
+
+    sqliteHistoryManifestState.inflight = fetch(SQLITE_HISTORY_MANIFEST_URL, { signal })
+      .then(response => {
+        if (!response.ok) throw new Error(`SQLite history manifest HTTP ${response.status}`);
+        return response.json();
+      })
+      .then(payload => {
+        sqliteHistoryManifestState.value = payload;
+        sqliteHistoryManifestState.fetchedAt = Date.now();
+        return payload;
+      })
+      .finally(() => {
+        sqliteHistoryManifestState.inflight = null;
+      });
+
+    return sqliteHistoryManifestState.inflight;
+  }
+
+  function resolveSqliteHistoryManifestEntry(manifest, itemHridName) {
+    const normalizedKey = mwi.ensureItemHrid(itemHridName) || itemHridName;
+    if (!manifest?.items || !normalizedKey) return null;
+    return manifest.items[normalizedKey] || manifest.items[itemHridName] || null;
+  }
+
+  function normalizeSqliteHistoryRows(payloadRows) {
+    return (Array.isArray(payloadRows) ? payloadRows : []).map(row => ({
+      time: Number(row.time) || 0,
+      a: row.a ?? row.ask ?? -1,
+      b: row.b ?? row.bid ?? -1,
+      p: row.p ?? row.price ?? null,
+      v: row.v ?? row.volume ?? null
+    })).filter(row => row.time > 0);
+  }
 
   class CoreMarket {
     marketData = {};//市场数据，带强化等级，存储格式{"/items/apple_yogurt:0":{ask,bid,time}}
@@ -2354,10 +2670,12 @@
     ttl = 300;//缓存时间，单位秒
     trade_ws = null;
     subItems = [];
+    officialSyncTimer = null;
     constructor() {
       //core data
       let marketDataStr = localStorage.getItem("MWICore_marketData") || "{}";
       this.marketData = JSON.parse(marketDataStr);
+      marketHistoryStore.init();
 
       //mwiapi data
       let mwiapiJsonStr = localStorage.getItem("MWIAPI_JSON_NEW");
@@ -2367,16 +2685,9 @@
         this.mergeMWIData(mwiapiObj);
       }
       if (!mwiapiObj || Date.now() / 1000 - mwiapiObj.timestamp > 600) {//超过10分才更新
-        fetch(MWIAPI_URL).then(res => {
-          res.text().then(mwiapiJsonStr => {
-            mwiapiObj = JSON.parse(mwiapiJsonStr);
-            this.mergeMWIData(mwiapiObj);
-            //更新本地缓存数据
-            localStorage.setItem("MWIAPI_JSON_NEW", mwiapiJsonStr);//更新本地缓存数据
-            console.info("MWIAPI_JSON updated:", new Date(mwiapiObj.timestamp * 1000).toLocaleString());
-          })
-        }).catch(err => { console.warn("MWIAPI_JSON update failed,using localdata"); });
+        this.refreshOfficialMarketData();
       }
+      this.officialSyncTimer = setInterval(() => { this.refreshOfficialMarketData(); }, 1000 * 600);
       //市场数据更新
       hookMessage("market_item_order_books_updated", obj => this.handleMessageMarketItemOrderBooksUpdated(obj, true));
       hookMessage("init_character_data", (msg) => {
@@ -2402,6 +2713,18 @@
         }
       });
       setInterval(() => { this.save(); }, 1000 * 600);//十分钟保存一次
+    }
+    refreshOfficialMarketData(force = false) {
+      let cached = JSON.parse(localStorage.getItem("MWIAPI_JSON_NEW") || "null");
+      if (!force && cached?.timestamp && Date.now() / 1000 - cached.timestamp < 3300) return;
+      fetch(MWIAPI_URL).then(res => {
+        res.text().then(mwiapiJsonStr => {
+          const mwiapiObj = JSON.parse(mwiapiJsonStr);
+          this.mergeMWIData(mwiapiObj);
+          localStorage.setItem("MWIAPI_JSON_NEW", mwiapiJsonStr);
+          console.info("MWIAPI_JSON updated:", new Date(mwiapiObj.timestamp * 1000).toLocaleString());
+        });
+      }).catch(err => { console.warn("MWIAPI_JSON update failed,using localdata"); });
     }
     handleMessageMarketItemOrderBooksUpdated(obj, upload = false) {
       //更新本地,游戏数据不带时间戳，市场服务器数据带时间戳
@@ -2457,6 +2780,7 @@
           });
         }
       });
+      marketHistoryStore.saveOfficialSnapshot(obj);
       this.save();
     }
     mergeCoreDataBeforeSave() {
@@ -2599,9 +2923,6 @@
         v.rise = 0;
       });
     }
-    save() {
-      localStorage.setItem("MWICore_marketData", JSON.stringify(this.marketData));
-    }
   }
   mwi.coreMarket = new CoreMarket();
   /*历史数据模块*/
@@ -2652,7 +2973,6 @@
     };
 
     config.favo = config.favo || {};
-    curDay = config.day;//读取设置
 
     let trade_history = JSON.parse(localStorage.getItem("mooket_trade_history") || "{}");
     function trade_history_migrate() {
@@ -2673,9 +2993,9 @@
     }
     trade_history_migrate();
 
-    window.onresize = function () {
+    window.addEventListener('resize', function () {
       checkSize();
-    };
+    });
     function checkSize() {
       if (window.innerWidth < window.innerHeight) {
         config.w = chartWidth = window.innerWidth * 0.92;
@@ -2687,6 +3007,41 @@
     }
     checkSize();
 
+    function getExpandedBounds() {
+      return {
+        maxWidth: Math.max(860, window.innerWidth),
+        maxHeight: Math.max(560, window.innerHeight)
+      };
+    }
+
+    function keepToggleButtonVisible() {
+      const rect = container.getBoundingClientRect();
+      const buttonRect = btn_close.getBoundingClientRect();
+      let nextLeft = rect.left;
+      let nextTop = rect.top;
+
+      if (buttonRect.left < 0) nextLeft += -buttonRect.left;
+      if (buttonRect.right > window.innerWidth) nextLeft -= (buttonRect.right - window.innerWidth);
+      if (buttonRect.top < 0) nextTop += -buttonRect.top;
+      if (buttonRect.bottom > window.innerHeight) nextTop -= (buttonRect.bottom - window.innerHeight);
+
+      container.style.left = `${Math.round(nextLeft)}px`;
+      container.style.top = `${Math.round(nextTop)}px`;
+    }
+
+    function clampExpandedContainer() {
+      const { maxWidth, maxHeight } = getExpandedBounds();
+      if (uiContainer.style.display === 'none') return;
+
+      const nextWidth = Math.min(container.offsetWidth || config.w || chartWidth, maxWidth);
+      const nextHeight = Math.min(container.offsetHeight || config.h || chartHeight, maxHeight);
+      container.style.width = `${nextWidth}px`;
+      container.style.height = `${nextHeight}px`;
+      container.style.maxWidth = `${maxWidth}px`;
+      container.style.maxHeight = `${maxHeight}px`;
+      keepToggleButtonVisible();
+    }
+
     // 创建容器元素并设置样式和位置
     const container = document.createElement('div');
     container.style.border = "1px solid #2a2e39";
@@ -2695,15 +3050,18 @@
     container.style.borderRadius = "12px";
     container.style.position = "fixed";
     container.style.zIndex = 10000;
-    container.style.top = `${Math.max(0, Math.min(config.y || 0, window.innerHeight - 50))}px`;
-    container.style.left = `${Math.max(0, Math.min(config.x || 0, window.innerWidth - 50))}px`;
-    container.style.width = `${Math.max(0, Math.min(config.w || chartWidth, window.innerWidth))}px`;
-    container.style.height = `${Math.max(0, Math.min(config.h || chartHeight, window.innerHeight))}px`;
-    container.style.resize = "both";
+    const initialBounds = getExpandedBounds();
+    const initialWidth = Math.max(860, Math.min(config.w || chartWidth, initialBounds.maxWidth));
+    const initialHeight = Math.max(560, Math.min(config.h || chartHeight, initialBounds.maxHeight));
+    container.style.top = `${Math.max(0, Number(config.y) || 0)}px`;
+    container.style.left = `${Math.max(0, Number(config.x) || 0)}px`;
+    container.style.width = `${initialWidth}px`;
+    container.style.height = `${initialHeight}px`;
+    container.style.resize = config.visible === false ? "none" : "both";
     container.style.overflow = "hidden";
     container.style.minHeight = "560px";
     container.style.minWidth = "860px";
-    container.style.maxWidth = `${window.innerWidth}px`;
+    container.style.maxWidth = `${initialBounds.maxWidth}px`;
     container.style.userSelect = "none";
     container.style.boxSizing = "border-box";
 
@@ -2713,14 +3071,45 @@
     const headerBar = document.createElement('div');
     headerBar.style.display = 'flex';
     headerBar.style.alignItems = 'center';
-    headerBar.style.justifyContent = 'space-between';
+    headerBar.style.justifyContent = 'flex-start';
+    headerBar.style.gap = '8px';
     headerBar.style.height = '46px';
     headerBar.style.padding = '8px 10px';
     headerBar.style.boxSizing = 'border-box';
     headerBar.style.borderBottom = '1px solid rgba(255,255,255,0.06)';
     headerBar.style.background = 'rgba(18,22,28,0.96)';
+    headerBar.style.cursor = 'move';
 
     container.appendChild(headerBar);
+
+    function applyExpandedShell() {
+      const { maxWidth, maxHeight } = getExpandedBounds();
+      container.style.border = "1px solid #2a2e39";
+      container.style.background = "#12161c";
+      container.style.boxShadow = "0 8px 28px rgba(0,0,0,0.45)";
+      container.style.borderRadius = "12px";
+      container.style.padding = "0";
+      container.style.maxWidth = `${maxWidth}px`;
+      container.style.maxHeight = `${maxHeight}px`;
+      headerBar.style.height = '46px';
+      headerBar.style.padding = '8px 10px';
+      headerBar.style.borderBottom = '1px solid rgba(255,255,255,0.06)';
+      headerBar.style.background = 'rgba(18,22,28,0.96)';
+    }
+
+    function applyCollapsedShell() {
+      container.style.border = "none";
+      container.style.background = "transparent";
+      container.style.boxShadow = "none";
+      container.style.borderRadius = "0";
+      container.style.padding = "0";
+      container.style.maxWidth = "none";
+      container.style.maxHeight = "none";
+      headerBar.style.height = 'auto';
+      headerBar.style.padding = '0';
+      headerBar.style.borderBottom = 'none';
+      headerBar.style.background = 'transparent';
+    }
 
     // 主布局
     const uiContainer = document.createElement('div');
@@ -2749,7 +3138,7 @@
     leftContainer.style.background = 'transparent';
     uiContainer.appendChild(leftContainer);
 
-    const days = [1, 7, 30, 90, 365];
+    const days = [1, 3, 7, 20, 60, 180];
     if (typeof config.dayIndex !== "number" || config.dayIndex < 0 || config.dayIndex >= days.length) {
     config.dayIndex = 0;
     }
@@ -2781,6 +3170,7 @@
     select.style.height = '30px';
     select.style.minWidth = '88px';
     select.style.padding = '0 10px';
+    select.style.marginLeft = '0';
     select.style.background = '#1b2028';
     select.style.color = '#e7ebf0';
     select.style.border = '1px solid #2f3541';
@@ -2801,13 +3191,94 @@
     }
 
     function updateMoodays() {
-    const labels = mwi.isZh ? ["24小时", "7天", "30天", "90天", "365天"] : ["24H", "7D", "30D", "90D", "365D"];
+    const labels = mwi.isZh ? ["1天", "3天", "7天", "20天", "60天", "180天"] : ["1D", "3D", "7D", "20D", "60D", "180D"];
     for (let i = 0; i < select.options.length; i++) {
     select.options[i].text = labels[i];
     }
     }
     updateMoodays();
     headerBar.appendChild(select);
+
+    function isResizeHandleHit(event) {
+      if (uiContainer.style.display === 'none') return false;
+      const rect = container.getBoundingClientRect();
+      const resizeEdge = 14;
+      return (
+        rect.right - event.clientX <= resizeEdge &&
+        rect.bottom - event.clientY <= resizeEdge
+      );
+    }
+
+    function canStartPanelDrag(event) {
+      if (event.button !== 0) return false;
+      if (isResizeHandleHit(event)) return false;
+      const interactiveSelector = [
+        'input',
+        'button',
+        'select',
+        'option',
+        'canvas',
+        'a',
+        '[role="button"]',
+        '[class*="Item_itemContainer__"]',
+        '#mooket_favo_panel',
+        '#mooket_orderbook_table'
+      ].join(', ');
+      if (event.target.closest(interactiveSelector)) {
+        return event.target === btn_close && uiContainer.style.display === 'none';
+      }
+      return event.target === container || event.target === headerBar || headerBar.contains(event.target);
+    }
+
+    function bindPanelDrag() {
+      let dragState = null;
+      let suppressToggleClick = false;
+
+      const movePanel = (clientX, clientY) => {
+        if (!dragState) return;
+        const deltaX = clientX - dragState.startX;
+        const deltaY = clientY - dragState.startY;
+        if (!dragState.active && Math.hypot(deltaX, deltaY) < 4) return;
+
+        dragState.active = true;
+        suppressToggleClick = true;
+        document.body.style.userSelect = 'none';
+        container.style.left = `${dragState.startLeft + deltaX}px`;
+        container.style.top = `${dragState.startTop + deltaY}px`;
+        keepToggleButtonVisible();
+      };
+
+      container.addEventListener('mousedown', (event) => {
+        if (!canStartPanelDrag(event)) return;
+        dragState = {
+          startX: event.clientX,
+          startY: event.clientY,
+          startLeft: parseFloat(container.style.left) || 0,
+          startTop: parseFloat(container.style.top) || 0,
+          active: false
+        };
+      });
+
+      document.addEventListener('mousemove', (event) => {
+        movePanel(event.clientX, event.clientY);
+      });
+
+      document.addEventListener('mouseup', () => {
+        if (!dragState) return;
+        const wasDragging = dragState.active;
+        dragState = null;
+        document.body.style.userSelect = '';
+        if (wasDragging) save_config();
+        setTimeout(() => { suppressToggleClick = false; }, 0);
+      });
+
+      btn_close.addEventListener('click', (event) => {
+        if (!suppressToggleClick) return;
+        event.preventDefault();
+        event.stopPropagation();
+      }, true);
+    }
+    bindPanelDrag();
 
     // 图表区域
     const chartWrap = document.createElement('div');
@@ -2835,6 +3306,17 @@
     metricBar.style.fontSize = '12px';
     metricBar.style.justifyContent = 'flex-start';
     chartWrap.appendChild(metricBar);
+
+    const chartStatusBar = document.createElement('div');
+    chartStatusBar.id = 'mooket_chart_status';
+    chartStatusBar.style.display = 'flex';
+    chartStatusBar.style.flexWrap = 'wrap';
+    chartStatusBar.style.gap = '8px 12px';
+    chartStatusBar.style.padding = '0 0 8px 0';
+    chartStatusBar.style.color = '#8fa0b3';
+    chartStatusBar.style.fontSize = '11px';
+    chartStatusBar.style.lineHeight = '1.35';
+    chartWrap.appendChild(chartStatusBar);
 
     const ctx = document.createElement('canvas');
     ctx.style.display = 'block';
@@ -2936,6 +3418,38 @@
       delete config.favo[itemHridLevel];
       save_config();
       sendFavo();
+    }
+    function getItemHridLevelFromElement(itemRoot) {
+      if (!itemRoot) return null;
+      const useEl = itemRoot.querySelector('svg.Icon_icon__2LtL_ use, [class*="Icon_icon__"] use');
+      const href = useEl?.getAttribute('href') || useEl?.getAttribute('xlink:href') || useEl?.href?.baseVal;
+      const iconName = href?.split('#')[1];
+      if (!iconName) return null;
+
+      const levelText = itemRoot.querySelector('.Item_enhancementLevel__19g-e, [class*="Item_enhancementLevel__"]')?.textContent || '';
+      const enhancementLevel = parseInt(levelText.replace('+', '').trim() || '0', 10) || 0;
+      return `/items/${iconName}:${enhancementLevel}`;
+    }
+    function bindGlobalItemContextMenu() {
+      document.addEventListener('contextmenu', (event) => {
+        if (mwi.character?.gameMode !== "standard") return;
+        if (favoContainer.contains(event.target)) return;
+        if (event.target.closest('#mooket_addFavo')) return;
+
+        const itemRoot = event.target.closest(
+          '.MarketplacePanel_marketItems__D4k7e [class*="Item_itemContainer__"], ' +
+          'td[class*="MarketplacePanel_item__"] [class*="Item_itemContainer__"], ' +
+          '.InventoryPanel_inventoryPanel__2wTeg [class*="Item_itemContainer__"], ' +
+          '[class*="InventoryPanel_inventoryPanel__"] [class*="Item_itemContainer__"]'
+        );
+        if (!itemRoot) return;
+
+        const itemHridLevel = getItemHridLevelFromElement(itemRoot);
+        if (!itemHridLevel) return;
+
+        event.preventDefault();
+        addFavo(itemHridLevel);
+      });
     }
     function updateFavo() {
       if (mwi.character?.gameMode !== "standard") {
@@ -3039,6 +3553,7 @@
       updateFavoLayout();
     }
 
+    bindGlobalItemContextMenu();
     sendFavo();//初始化自选
     addEventListener('MWICoreItemPriceUpdated', updateFavo);
 
@@ -3068,7 +3583,36 @@
 
     window.addEventListener('resize', function () {
       updateFavoLayout();
+      if (uiContainer.style.display !== 'none') {
+        clampExpandedContainer();
+        save_config();
+      } else {
+        keepToggleButtonVisible();
+        save_config();
+      }
     });
+
+    let resizeSaveTimer = null;
+    function scheduleResizePersistence() {
+      if (uiContainer.style.display === 'none') return;
+      updateFavoLayout();
+      if (resizeSaveTimer) clearTimeout(resizeSaveTimer);
+      resizeSaveTimer = setTimeout(() => {
+        clampExpandedContainer();
+        save_config();
+      }, 120);
+    }
+
+    if (typeof ResizeObserver !== 'undefined') {
+      const panelResizeObserver = new ResizeObserver(() => {
+        scheduleResizePersistence();
+      });
+      panelResizeObserver.observe(container);
+    }
+
+    function getOrderBookCacheKey(itemHrid, level = 0) {
+      return `${itemHrid}:${Number(level) || 0}`;
+    }
 
     function ingestOrderBookPayload(payload) {
       const eventType =
@@ -3094,23 +3638,21 @@
         return false;
       }
 
-      latestOrderBooksByItem.set(itemHrid, {
-        marketItemOrderBooks: {
+      const updatedAt = Date.now();
+      orderBooks.forEach((book, level) => {
+        latestOrderBooksByItem.set(getOrderBookCacheKey(itemHrid, level), {
           itemHrid,
-          orderBooks
-        },
-        updatedAt: Date.now()
+          level,
+          orderBook: book || { asks: [], bids: [] },
+          updatedAt
+        });
       });
 
-      console.log('捕获到订单簿缓存', itemHrid, orderBooks);
-
       if (itemHrid === curHridName) {
-        updateOrderBook({
-          marketItemOrderBooks: {
-            itemHrid,
-            orderBooks
-          }
-        });
+        const currentBook = latestOrderBooksByItem.get(getOrderBookCacheKey(itemHrid, curLevel));
+        if (currentBook) {
+          updateOrderBook(currentBook);
+        }
       }
 
       return true;
@@ -3124,22 +3666,31 @@
     function toggle() {
 
       if (uiContainer.style.display === 'none') {//展开
+        applyExpandedShell();
         uiContainer.style.display = 'flex';
         chartWrap.style.display = 'block';
         bottomPanel.style.display = 'grid';
         favoContainer.style.display = 'grid';
         ctx.style.display = 'block';
+        container.style.resize = "both";
+        select.style.display = 'inline-flex';
+        headerBar.style.justifyContent = 'flex-start';
 
         btn_close.value = '📈' + (mwi.isZh ? "隐藏图表" : "Hide");
         leftContainer.style.position = 'relative';
         leftContainer.style.top = '0';
         leftContainer.style.left = '0';
-        container.style.width = config.w + "px";
-        container.style.height = config.h + "px";
+        const { maxWidth, maxHeight } = getExpandedBounds();
+        container.style.width = Math.min(config.w || chartWidth, maxWidth) + "px";
+        container.style.height = Math.min(config.h || chartHeight, maxHeight) + "px";
         container.style.minHeight = "560px";
         container.style.minWidth = "860px";
+        container.style.maxWidth = `${maxWidth}px`;
+        container.style.maxHeight = `${maxHeight}px`;
+        headerBar.style.marginBottom = '0';
 
         config.visible = true;
+        clampExpandedContainer();
 
         if (delayItemHridName) {
           requestItemPrice(delayItemHridName, curDay, delayItemLevel);
@@ -3149,19 +3700,25 @@
         if (chart) chart.resize();
         save_config();
       } else {//隐藏
+        applyCollapsedShell();
         uiContainer.style.display = 'none';
         chartWrap.style.display = 'none';
         bottomPanel.style.display = 'none';
         favoContainer.style.display = 'none';
+        container.style.resize = "none";
+        select.style.display = 'none';
+        headerBar.style.justifyContent = 'flex-start';
+        headerBar.style.marginBottom = '0';
 
-        container.style.width = config.minWidth + "px";
-        container.style.height = config.minHeight + "px";
-        container.style.minHeight = "min-content";
-        container.style.minWidth = "112px";
+        container.style.width = "fit-content";
+        container.style.height = "fit-content";
+        container.style.minHeight = "0";
+        container.style.maxHeight = "none";
+        container.style.minWidth = "0";
 
         if (!config.keepsize) {
-          container.style.width = "min-content";
-          container.style.height = "min-content";
+          container.style.width = "fit-content";
+          container.style.height = "fit-content";
         }
 
         btn_close.value = '📈' + (mwi.isZh ? "显示图表" : "Show");
@@ -3170,6 +3727,7 @@
         leftContainer.style.left = 0;
         config.visible = false;
 
+        keepToggleButtonVisible();
         updateFavo();
         save_config();
       }
@@ -3180,7 +3738,7 @@
       }
     }
 
-    // ====== 底部模块：订单表 + 百分比 + 建议 ======
+    // ====== 底部模块：订单表 + 市场摘要 ======
     const bottomPanel = document.createElement('section');
     const orderBookPanel = document.createElement('section');
     const orderBookHeader = document.createElement('section');
@@ -3373,139 +3931,38 @@
       `;
     }
 
-    function buildMarketInsight({
+    function buildMarketSummary({
       lastBid,
       lastAsk,
       lastMid,
-      lastVol,
-      ma5,
-      ma10,
-      ma20,
+      dayVolumeTotal,
       bidPct,
-      askPct,
-      bidTotal = 0,
-      askTotal = 0
+      askPct
     }) {
-      let trend = mwi.isZh ? '方向不明' : 'Neutral';
-      let liquidity = mwi.isZh ? '一般' : 'Normal';
-      let pressure = mwi.isZh ? '买卖均衡' : 'Balanced';
-      let spreadState = mwi.isZh ? '正常' : 'Normal';
-      let support = mwi.isZh ? '一般' : 'Normal';
-      let risk = mwi.isZh ? '中' : 'Medium';
-      let volumeState = mwi.isZh ? '成交平稳' : 'Stable';
-      const tips = [];
-
-      let spreadPct = null;
-      if (lastMid && lastAsk != null && lastBid != null) {
-        spreadPct = (lastAsk - lastBid) / lastMid * 100;
-
-        if (spreadPct < 1) {
-          liquidity = mwi.isZh ? '较好' : 'Good';
-          spreadState = mwi.isZh ? '很窄' : 'Very narrow';
-          tips.push(mwi.isZh ? '当前价差较窄，成交效率较好。' : 'Spread is narrow and execution is efficient.');
-        } else if (spreadPct < 3) {
-          liquidity = mwi.isZh ? '一般' : 'Normal';
-          spreadState = mwi.isZh ? '正常' : 'Normal';
-          tips.push(mwi.isZh ? '当前价差处于正常范围。' : 'Spread is within a normal range.');
-        } else if (spreadPct < 6) {
-          liquidity = mwi.isZh ? '偏弱' : 'Weak';
-          spreadState = mwi.isZh ? '偏宽' : 'Wide';
-          risk = mwi.isZh ? '中' : 'Medium';
-          tips.push(mwi.isZh ? '价差偏宽，短线成交滑点会更明显。' : 'Spread is wide and slippage may be noticeable.');
-        } else {
-          liquidity = mwi.isZh ? '较弱' : 'Poor';
-          spreadState = mwi.isZh ? '很宽' : 'Very wide';
-          risk = mwi.isZh ? '高' : 'High';
-          tips.push(mwi.isZh ? '价差很宽，流动性较差，不适合追价。' : 'Spread is very wide and liquidity is poor.');
-        }
+      let dominantSide = mwi.isZh ? '均衡' : 'Balanced';
+      let dominantSideColor = '#9fb3c8';
+      if (bidPct >= 60) {
+        dominantSide = mwi.isZh ? '买方' : 'Bid';
+        dominantSideColor = '#20c997';
+      } else if (askPct >= 60) {
+        dominantSide = mwi.isZh ? '卖方' : 'Ask';
+        dominantSideColor = '#ff6b6b';
       }
 
-      if (ma5 != null && ma10 != null && ma20 != null) {
-        if (ma5 > ma10 && ma10 > ma20) {
-          trend = mwi.isZh ? '短线偏强' : 'Bullish';
-          tips.push(mwi.isZh ? 'MA5 > MA10 > MA20，短线趋势偏强。' : 'MA5 > MA10 > MA20, short-term trend is bullish.');
-        } else if (ma5 < ma10 && ma10 < ma20) {
-          trend = mwi.isZh ? '短线偏弱' : 'Bearish';
-          tips.push(mwi.isZh ? 'MA5 < MA10 < MA20，短线趋势偏弱。' : 'MA5 < MA10 < MA20, short-term trend is bearish.');
-        } else {
-          trend = mwi.isZh ? '震荡整理' : 'Sideways';
-          tips.push(mwi.isZh ? '均线交错，当前更偏震荡整理。' : 'Moving averages are mixed, market is sideways.');
-        }
-      }
-
-      if (bidPct >= 65) {
-        pressure = mwi.isZh ? '买盘主导' : 'Bid-dominant';
-        support = mwi.isZh ? '较强' : 'Strong';
-        tips.push(mwi.isZh ? '买盘占比明显更高，短线承接较强。' : 'Bid side dominates, short-term support is stronger.');
-      } else if (askPct >= 65) {
-        pressure = mwi.isZh ? '卖盘主导' : 'Ask-dominant';
-        support = mwi.isZh ? '较弱' : 'Weak';
-        risk = risk === (mwi.isZh ? '高' : 'High') ? risk : (mwi.isZh ? '中高' : 'Med-High');
-        tips.push(mwi.isZh ? '卖盘占比明显更高，上方抛压更重。' : 'Ask side dominates, overhead pressure is stronger.');
-      } else {
-        pressure = mwi.isZh ? '买卖均衡' : 'Balanced';
-        support = mwi.isZh ? '一般' : 'Normal';
-        tips.push(mwi.isZh ? '买卖盘分布相对均衡。' : 'Bid/ask balance is relatively even.');
-      }
-
-      if ((lastVol || 0) <= 0) {
-        volumeState = mwi.isZh ? '极低' : 'Very low';
-        risk = risk === (mwi.isZh ? '高' : 'High') ? risk : (mwi.isZh ? '中' : 'Medium');
-        tips.push(mwi.isZh ? '当前成交量很低，信号可靠性有限。' : 'Volume is very low, so signals are less reliable.');
-      } else if ((lastVol || 0) < 1000) {
-        volumeState = mwi.isZh ? '偏低' : 'Low';
-        tips.push(mwi.isZh ? '成交量偏低，更适合观察而不是追价。' : 'Volume is low, better for observation than chasing.');
-      } else {
-        volumeState = mwi.isZh ? '正常' : 'Normal';
-      }
-
-      if (bidTotal > 0 || askTotal > 0) {
-        const depthDiff = Math.abs(bidTotal - askTotal) / Math.max(bidTotal + askTotal, 1);
-        if (depthDiff < 0.1) {
-          tips.push(mwi.isZh ? '前排深度比较接近，短线更容易维持横盘。' : 'Front-book depth is similar, range behavior is more likely.');
-        } else if (bidTotal > askTotal) {
-          tips.push(mwi.isZh ? '买盘深度高于卖盘，回落后更容易出现承接。' : 'Bid depth exceeds ask depth, dips may find support.');
-        } else {
-          tips.push(mwi.isZh ? '卖盘深度高于买盘，向上推进阻力更大。' : 'Ask depth exceeds bid depth, upward moves face more resistance.');
-        }
-      }
+      const spreadValue = (lastAsk != null && lastBid != null) ? Math.max(0, lastAsk - lastBid) : null;
 
       return {
-        trend,
-        liquidity,
-        pressure,
-        spreadState,
-        support,
-        risk,
-        volumeState,
-        spreadPct,
-        tips: tips.slice(0, 5)
+        dominantSide,
+        dominantSideColor,
+        spreadValue,
+        volumeValue: dayVolumeTotal ?? null
       };
     }
 
-    function getInsightTone(value) {
-      const good = ['较好', 'Good', '买盘主导', 'Bid-dominant', '较强', 'Strong', '短线偏强', 'Bullish', '很窄', 'Very narrow', '正常', 'Normal'];
-      const bad = ['较弱', 'Poor', '偏弱', 'Weak', '卖盘主导', 'Ask-dominant', '短线偏弱', 'Bearish', '很宽', 'Very wide', '偏宽', 'Wide', '高', 'High', '中高', 'Med-High', '极低', 'Very low', '低', 'Low'];
-      const neutral = ['一般', 'Balanced', '买卖均衡', '方向不明', 'Neutral', '震荡整理', 'Sideways', '中', 'Medium', '成交平稳', 'Stable'];
-
-      if (good.includes(value)) return '#20c997';
-      if (bad.includes(value)) return '#ff6b6b';
-      if (neutral.includes(value)) return '#9fb3c8';
-      return '#c8d1dc';
-    }
-
-    function renderInsightPanel(insight) {
-      const trendColor = getInsightTone(insight.trend);
-      const liquidityColor = getInsightTone(insight.liquidity);
-      const pressureColor = getInsightTone(insight.pressure);
-      const spreadColor = getInsightTone(insight.spreadState);
-      const supportColor = getInsightTone(insight.support);
-      const riskColor = getInsightTone(insight.risk);
-      const volumeColor = getInsightTone(insight.volumeState);
-
+    function renderInsightPanel(summary) {
       insightPanel.innerHTML = `
         <section style="font-size:13px;font-weight:600;color:#c8d1dc;margin-bottom:10px;">
-          ${mwi.isZh ? '指标建议' : 'Insights'}
+          ${mwi.isZh ? '市场摘要' : 'Market Summary'}
         </section>
 
         <section style="
@@ -3516,27 +3973,11 @@
           color:#c8d1dc;
           font-weight:600;
           line-height:1.45;
-          margin-bottom:8px;
+          margin-bottom:4px;
         ">
-          <div>${mwi.isZh ? '趋势' : 'Trend'}：<span style="color:${trendColor};">${insight.trend}</span></div>
-          <div>${mwi.isZh ? '流动性' : 'Liquidity'}：<span style="color:${liquidityColor};">${insight.liquidity}</span></div>
-          <div>${mwi.isZh ? '盘口' : 'Order book'}：<span style="color:${pressureColor};">${insight.pressure}</span></div>
-          <div>${mwi.isZh ? '价差' : 'Spread'}：<span style="color:${spreadColor};">${insight.spreadState}</span></div>
-          <div>${mwi.isZh ? '支撑' : 'Support'}：<span style="color:${supportColor};">${insight.support}</span></div>
-          <div>${mwi.isZh ? '风险' : 'Risk'}：<span style="color:${riskColor};">${insight.risk}</span></div>
-          <div>${mwi.isZh ? '成交' : 'Volume'}：<span style="color:${volumeColor};">${insight.volumeState}</span></div>
-          <div>${mwi.isZh ? 'Spread%' : 'Spread%'}：<span style="color:#c8d1dc;">${insight.spreadPct != null ? insight.spreadPct.toFixed(2) + '%' : '-'}</span></div>
-        </section>
-
-        <section style="
-          margin-top:2px;
-          font-size:9px;
-          color:#9fb3c8;
-          line-height:1.45;
-          border-top:1px solid rgba(255,255,255,0.06);
-          padding-top:6px;
-        ">
-          ${(insight.tips || []).map(t => `<div style="margin-bottom:2px;">• ${t}</div>`).join('')}
+          <div>${mwi.isZh ? '主力' : 'Dominant'}：<span style="color:${summary.dominantSideColor};">${summary.dominantSide}</span></div>
+          <div>${mwi.isZh ? '价差' : 'Spread'}：<span style="color:#c8d1dc;">${showNumber(summary.spreadValue ?? '-')}</span></div>
+          <div>${mwi.isZh ? '成交量' : 'Volume'}：<span style="color:#c8d1dc;">${showNumber(summary.volumeValue ?? '-')}</span></div>
         </section>
       `;
     }
@@ -3577,89 +4018,39 @@
       return merged;
     }
 
-    function cacheOrderBookPayload(payload) {
-      try {
-        const itemHrid =
-          payload?.marketItemOrderBooks?.itemHrid ??
-          payload?.itemHrid ??
-          payload?.detail?.itemHrid ??
-          payload?.detail?.obj?.marketItemOrderBooks?.itemHrid ??
-          payload?.obj?.marketItemOrderBooks?.itemHrid;
-
-        const orderBooks =
-          payload?.marketItemOrderBooks?.orderBooks ??
-          payload?.orderBooks ??
-          payload?.detail?.orderBooks ??
-          payload?.detail?.obj?.marketItemOrderBooks?.orderBooks ??
-          payload?.obj?.marketItemOrderBooks?.orderBooks;
-
-        if (!itemHrid || !Array.isArray(orderBooks) || !orderBooks.length) return false;
-
-        latestOrderBooksByItem.set(itemHrid, {
-          marketItemOrderBooks: {
-            itemHrid,
-            orderBooks
-          },
-          updatedAt: Date.now()
-        });
-
-        return true;
-      } catch (err) {
-        console.error('缓存订单簿失败', err);
-        return false;
-      }
-    }
-
     function updateOrderBook(rawData) {
-    console.log('更新后的订单簿数据', rawData);
-    
-    const source =
-      rawData?.marketItemOrderBooks?.orderBooks?.[0] ??
-      rawData?.orderBooks?.[0] ??
-      rawData;
+      const source =
+        rawData?.orderBook ??
+        rawData?.marketItemOrderBook ??
+        rawData?.marketItemOrderBooks?.orderBooks?.[rawData?.level ?? 0] ??
+        rawData?.orderBooks?.[rawData?.level ?? 0] ??
+        rawData;
 
-    const asks = mergeOrdersByPrice(
-      source?.asks || source?.sellOrders || source?.sell_orders || [],
-      'ask'
-    ).slice(0, 20);
+      const asks = mergeOrdersByPrice(
+        source?.asks || source?.sellOrders || source?.sell_orders || [],
+        'ask'
+      ).slice(0, 20);
 
-    const bids = mergeOrdersByPrice(
-      source?.bids || source?.buyOrders || source?.buy_orders || [],
-      'bid'
-    ).slice(0, 20);
+      const bids = mergeOrdersByPrice(
+        source?.bids || source?.buyOrders || source?.buy_orders || [],
+        'bid'
+      ).slice(0, 20);
 
-    const askTotal = asks.reduce((sum, x) => sum + Number(x.volume || 0), 0);
-    const bidTotal = bids.reduce((sum, x) => sum + Number(x.volume || 0), 0);
-    const total = askTotal + bidTotal || 1;
+      const askTotal = asks.reduce((sum, x) => sum + Number(x.volume || 0), 0);
+      const bidTotal = bids.reduce((sum, x) => sum + Number(x.volume || 0), 0);
+      const total = askTotal + bidTotal;
 
-    currentOrderBook = {
-      asks,
-      bids,
-      askTotal,
-      bidTotal,
-      askPct: askTotal / total * 100,
-      bidPct: bidTotal / total * 100,
-      updatedAt: Date.now()
-    };
+      currentOrderBook = {
+        asks,
+        bids,
+        askTotal,
+        bidTotal,
+        askPct: total > 0 ? askTotal / total * 100 : 0,
+        bidPct: total > 0 ? bidTotal / total * 100 : 0,
+        updatedAt: rawData?.updatedAt || Date.now()
+      };
 
-    renderOrderBook(currentOrderBook);
-  }
-
-    function fillMockOrderBook() {
-      updateOrderBook({
-        asks: [
-          { price: 86, volume: 1200 },
-          { price: 87, volume: 950 },
-          { price: 88, volume: 620 },
-          { price: 89, volume: 500 }
-        ],
-        bids: [
-          { price: 84, volume: 1100 },
-          { price: 83, volume: 860 },
-          { price: 82, volume: 540 },
-          { price: 81, volume: 420 }
-        ]
-      });
+      renderOrderBook(currentOrderBook);
     }
 
     let chart = new Chart(ctx, {
@@ -3785,6 +4176,174 @@
       }
     });
 
+    const thirdPartyHistoryInflight = new Map();
+    const sqliteHistoryInflight = new Map();
+    const preloadState = {
+      running: false,
+      total: 0,
+      done: 0,
+      displayTotal: 0,
+      displayDone: 0,
+      failed: 0,
+      currentKey: null
+    };
+
+    async function fetchThirdPartyHistory(itemHridName, level = 0, day = 1, signal) {
+      const cacheKey = `${itemHridName}:${Number(level) || 0}:${Number(day) || 1}`;
+      if (thirdPartyHistoryInflight.has(cacheKey)) {
+        return thirdPartyHistoryInflight.get(cacheKey);
+      }
+
+      const requestPromise = (async () => {
+      const params = new URLSearchParams();
+      params.append("item_id", itemHridName);
+      params.append("variant", String(Number(level) || 0));
+      params.append("days", String(Number(day) || 1));
+
+      const response = await fetch(`${THIRD_PARTY_HISTORY_URL}?${params}`, { signal });
+      if (!response.ok) {
+        throw new Error(`Third party history HTTP ${response.status}`);
+      }
+
+      const payload = await response.json();
+      const rows = Array.isArray(payload) ? payload : payload?.data || payload?.rows || [];
+      if (!Array.isArray(rows)) {
+        throw new Error("Third party history payload is not an array");
+      }
+
+      await marketHistoryStore.saveHistorySeries(itemHridName, level, rows, "third_party_history", { days: day });
+      return rows;
+      })();
+
+      thirdPartyHistoryInflight.set(cacheKey, requestPromise);
+      return requestPromise.finally(() => {
+        thirdPartyHistoryInflight.delete(cacheKey);
+      });
+    }
+
+    async function fetchSqliteHistory(itemHridName, level = 0, day = 1, signal) {
+      if (Number(level) !== 0) return [];
+
+      const manifest = await fetchSqliteHistoryManifest(signal);
+      const entry = resolveSqliteHistoryManifestEntry(manifest, itemHridName);
+      if (!entry?.path) return [];
+
+      const cacheKey = `${itemHridName}:${entry.path}`;
+      if (sqliteHistoryInflight.has(cacheKey)) {
+        return sqliteHistoryInflight.get(cacheKey);
+      }
+
+      const requestPromise = (async () => {
+        const response = await fetch(toAbsoluteUrl(entry.path, SQLITE_HISTORY_MANIFEST_URL), { signal });
+        if (!response.ok) {
+          throw new Error(`SQLite history shard HTTP ${response.status}`);
+        }
+
+        const payload = await response.json();
+        const rows = normalizeSqliteHistoryRows(payload?.rows || payload);
+        if (!rows.length) return [];
+
+        await marketHistoryStore.saveHistorySeries(
+          itemHridName,
+          level,
+          rows,
+          "sqlite_history",
+          { days: Number(entry.maxDays || day) || day }
+        );
+        return rows;
+      })();
+
+      sqliteHistoryInflight.set(cacheKey, requestPromise);
+      return requestPromise.finally(() => {
+        sqliteHistoryInflight.delete(cacheKey);
+      });
+    }
+
+    function buildFullPreloadQueue() {
+      const snapshot = JSON.parse(localStorage.getItem("MWIAPI_JSON_NEW") || "null");
+      const marketData = snapshot?.marketData || {};
+      const queue = [];
+      Object.entries(marketData).forEach(([itemHrid, variants]) => {
+        if (!itemHrid?.startsWith("/items/")) return;
+        Object.keys(variants || {}).forEach(variant => {
+          queue.push({ itemHrid, variant: Number(variant) || 0 });
+        });
+      });
+      queue.sort((a, b) => {
+        if (a.itemHrid === b.itemHrid) return a.variant - b.variant;
+        return a.itemHrid.localeCompare(b.itemHrid);
+      });
+      return queue;
+    }
+
+    function countUniqueItemsInQueue(queue) {
+      return new Set((queue || []).map(entry => entry.itemHrid).filter(Boolean)).size;
+    }
+
+    async function startFullHistoryWarmup() {
+      if (preloadState.running) return;
+      const warmupMeta = await marketHistoryStore.getMeta("fullHistoryWarmup");
+      if (warmupMeta?.completed) return;
+
+      const queue = buildFullPreloadQueue();
+      if (!queue.length) return;
+
+      preloadState.running = true;
+      preloadState.total = queue.length;
+      preloadState.done = 0;
+      preloadState.displayTotal = countUniqueItemsInQueue(queue);
+      preloadState.displayDone = 0;
+      preloadState.failed = 0;
+      preloadState.currentKey = null;
+      const completedItems = new Set();
+
+      for (const entry of queue) {
+        const pairKey = `history:third_party_history:${entry.itemHrid}:${entry.variant}`;
+        const pairMeta = await marketHistoryStore.getMeta(pairKey);
+        if (Number(pairMeta?.days || 0) >= FULL_PRELOAD_DAYS) {
+          preloadState.done += 1;
+          completedItems.add(entry.itemHrid);
+          preloadState.displayDone = completedItems.size;
+          continue;
+        }
+
+        preloadState.currentKey = `${entry.itemHrid}:${entry.variant}`;
+        try {
+          await fetchThirdPartyHistory(entry.itemHrid, entry.variant, FULL_PRELOAD_DAYS);
+        } catch (error) {
+          preloadState.failed += 1;
+          console.warn("fullHistoryWarmup item failed", preloadState.currentKey, error);
+        }
+        preloadState.done += 1;
+        completedItems.add(entry.itemHrid);
+        preloadState.displayDone = completedItems.size;
+        await marketHistoryStore.setMeta("fullHistoryWarmup", {
+          completed: false,
+          updatedAt: Math.floor(Date.now() / 1000),
+          total: preloadState.total,
+          done: preloadState.done,
+          displayTotal: preloadState.displayTotal,
+          displayDone: preloadState.displayDone,
+          failed: preloadState.failed,
+          currentKey: preloadState.currentKey
+        });
+        await new Promise(resolve => setTimeout(resolve, 120));
+      }
+
+      preloadState.running = false;
+      preloadState.currentKey = null;
+      await marketHistoryStore.setMeta("fullHistoryWarmup", {
+        completed: true,
+        completedAt: Math.floor(Date.now() / 1000),
+        total: preloadState.total,
+        done: preloadState.done,
+        displayTotal: preloadState.displayTotal,
+        displayDone: preloadState.displayDone,
+        failed: preloadState.failed
+      });
+      console.info("fullHistoryWarmup completed", preloadState.done, preloadState.failed);
+    }
+
     function requestItemPrice(itemHridName, day = 1, level = 0) {
       if (!itemHridName) return;
       if (curHridName === itemHridName && curLevel == level && curDay == day) return;//防止重复请求
@@ -3807,9 +4366,121 @@
       params.append("name", curHridName);
       params.append("level", curLevel);
       params.append("time", time);
-      fetch(`${HOST}/market/item/history?${params}`).then(res => {
-        res.json().then(data => updateChart(data, curDay));
-      }).catch(err => console.error("请求历史价格失败", err));
+      historyRequestToken += 1;
+      const requestToken = historyRequestToken;
+      historyAbortController?.abort();
+      historyAbortController = new AbortController();
+
+      marketHistoryStore.queryHistory(curHridName, curLevel, day)
+        .then(async rows => {
+          if (
+            requestToken !== historyRequestToken ||
+            curHridName !== itemHridName ||
+            Number(curLevel) !== Number(level) ||
+            Number(curDay) !== Number(day)
+          ) {
+            return true;
+          }
+
+          if (marketHistoryStore.hasCoverage(rows, day)) {
+            const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
+            updateChart(marketHistoryStore.toChartData(rows, stats, day), curDay);
+            return true;
+          }
+
+          try {
+            const importedRows = await fetchThirdPartyHistory(curHridName, curLevel, day, historyAbortController.signal);
+            if (
+              requestToken !== historyRequestToken ||
+              curHridName !== itemHridName ||
+              Number(curLevel) !== Number(level) ||
+              Number(curDay) !== Number(day)
+            ) {
+              return true;
+            }
+
+            if (importedRows.length > 0) {
+              const mergedRows = await marketHistoryStore.queryHistory(curHridName, curLevel, day);
+              const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
+              if (marketHistoryStore.hasCoverage(mergedRows, day)) {
+                updateChart(marketHistoryStore.toChartData(mergedRows, stats, day), curDay);
+                return true;
+              }
+            }
+          } catch (err) {
+            if (err?.name === 'AbortError') return true;
+            console.warn("第三方历史接口读取失败，回退旧接口", err);
+          }
+
+          if (Number(curLevel) === 0 && Number(day) >= SQLITE_HISTORY_IMPORT_MIN_DAYS) {
+            try {
+              const importedRows = await fetchSqliteHistory(curHridName, curLevel, day, historyAbortController.signal);
+              if (
+                requestToken !== historyRequestToken ||
+                curHridName !== itemHridName ||
+                Number(curLevel) !== Number(level) ||
+                Number(curDay) !== Number(day)
+              ) {
+                return true;
+              }
+
+              if (importedRows.length > 0) {
+                const mergedRows = await marketHistoryStore.queryHistory(curHridName, curLevel, day);
+                const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
+                if (marketHistoryStore.hasCoverage(mergedRows, day)) {
+                  updateChart(marketHistoryStore.toChartData(mergedRows, stats, day), curDay);
+                  return true;
+                }
+              }
+            } catch (err) {
+              if (err?.name === 'AbortError') return true;
+              console.warn("SQLite 历史分片读取失败，回退旧接口", err);
+            }
+          }
+
+          return fetch(`${HOST}/market/item/history?${params}`, { signal: historyAbortController.signal })
+            .then(res => res.json())
+            .then(async data => {
+              if (
+                requestToken !== historyRequestToken ||
+                curHridName !== itemHridName ||
+                Number(curLevel) !== Number(level) ||
+                Number(curDay) !== Number(day)
+              ) {
+                return;
+              }
+              const fallbackRows = [];
+              const bidRows = data?.bid || data?.bids || [];
+              const askRows = data?.ask || data?.asks || [];
+              const fallbackLength = Math.min(bidRows.length, askRows.length);
+              for (let i = 0; i < fallbackLength; i++) {
+                const bidRow = bidRows[i] || {};
+                const askRow = askRows[i] || {};
+                fallbackRows.push({
+                  time: askRow.time ?? bidRow.time,
+                  a: askRow.price ?? askRow.ask ?? -1,
+                  b: bidRow.price ?? bidRow.bid ?? -1,
+                  p: askRow.avg ?? bidRow.avg ?? 0,
+                  v: askRow.volume ?? bidRow.volume ?? askRow.v ?? bidRow.v ?? 0
+                });
+              }
+              if (fallbackRows.length > 0) {
+                await marketHistoryStore.saveHistorySeries(curHridName, curLevel, fallbackRows, "legacy_history", { days: day });
+                const mergedRows = await marketHistoryStore.queryHistory(curHridName, curLevel, day);
+                const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
+                updateChart(marketHistoryStore.toChartData(mergedRows, stats, day), curDay);
+                return;
+              }
+              updateChart(data, curDay);
+            })
+            .catch(err => {
+              if (err?.name === 'AbortError') return;
+              console.error("请求历史价格失败", err);
+            });
+        })
+        .catch(err => {
+          console.error("读取本地历史失败", err);
+        });
 
       requestOrderBook(curHridName, curLevel);
     }
@@ -3817,10 +4488,13 @@
     const latestOrderBooksByItem = new Map();
     let orderBookRetryTimer = null;
     let orderBookRetryToken = 0;
+    let historyRequestToken = 0;
+    let historyAbortController = null;
 
     function requestOrderBook(itemHridName, level = 0) {
       orderBookRetryToken += 1;
       const currentToken = orderBookRetryToken;
+      const cacheKey = getOrderBookCacheKey(itemHridName, level);
 
       if (orderBookRetryTimer) {
         clearTimeout(orderBookRetryTimer);
@@ -3834,14 +4508,12 @@
         if (currentToken !== orderBookRetryToken) return;
 
         try {
-          const cached = latestOrderBooksByItem.get(itemHridName);
+          const cached = latestOrderBooksByItem.get(cacheKey);
 
           if (
             cached &&
-            cached.marketItemOrderBooks &&
-            cached.marketItemOrderBooks.itemHrid === itemHridName &&
-            Array.isArray(cached.marketItemOrderBooks.orderBooks) &&
-            cached.marketItemOrderBooks.orderBooks.length > 0
+            cached.itemHrid === itemHridName &&
+            cached.level === Number(level || 0)
           ) {
             if (orderBookRetryTimer) {
               clearTimeout(orderBookRetryTimer);
@@ -3858,8 +4530,13 @@
             return;
           }
 
-          console.warn('订单簿多次重试后仍未就绪，使用占位数据', itemHridName);
-          fillMockOrderBook();
+          console.warn('订单簿多次重试后仍未就绪，显示空盘口', itemHridName, level);
+          updateOrderBook({
+            itemHrid: itemHridName,
+            level: Number(level || 0),
+            orderBook: { asks: [], bids: [] },
+            updatedAt: 0
+          });
         } catch (err) {
           if (attempt < maxAttempts) {
             orderBookRetryTimer = setTimeout(() => {
@@ -3869,7 +4546,12 @@
           }
 
           console.error('读取订单簿失败', err);
-          fillMockOrderBook();
+          updateOrderBook({
+            itemHrid: itemHridName,
+            level: Number(level || 0),
+            orderBook: { asks: [], bids: [] },
+            updatedAt: 0
+          });
         }
       };
 
@@ -3891,14 +4573,15 @@
       // 根据时间范围选择格式
       switch (parseInt(range)) {
         case 1:
+        case 3:
           return `${hours}:${minutes}`;
 
         case 7:
-        case 30:
+        case 20:
           return `${month}/${day} ${hours}:${minutes}`;
 
-        case 90:
-        case 365:
+        case 60:
+        case 180:
           return `${shortYear}/${month}/${day}`;
 
         default:
@@ -3944,37 +4627,31 @@
       return 0.1;
     }
 
-    function calcMA(series, period) {
-      const result = [];
-      for (let i = 0; i < series.length; i++) {
-        if (i < period - 1) {
-          result.push(null);
-          continue;
-        }
-        const window = series.slice(i - period + 1, i + 1).filter(v => v !== null && v !== undefined);
-        if (window.length < period) {
-          result.push(null);
-          continue;
-        }
-        const avg = window.reduce((a, b) => a + b, 0) / period;
-        result.push(avg);
-      }
-      
-      return result;
-    }
-
     function calcAxisBounds(prices) {
-      const valid = prices.filter(v => v !== null && v !== undefined && !isNaN(v));
+      const valid = prices.filter(v => v !== null && v !== undefined && !isNaN(v) && Number(v) > 0);
       if (!valid.length) return { min: 0, max: 1 };
 
       const minPrice = Math.min(...valid);
       const maxPrice = Math.max(...valid);
       const step = getPriceStep(maxPrice);
+      const range = Math.max(maxPrice - minPrice, maxPrice * 0.08, 1);
+      const padding = Math.max(step * 2, range * 0.08);
 
       return {
-        min: Math.max(0, minPrice - step * 2),
-        max: maxPrice + step * 2
+        min: Math.max(0, minPrice - padding),
+        max: maxPrice + padding
       };
+    }
+
+    function renderChartStatus(status = {}) {
+      const parts = [];
+      if (status.cachedDays !== undefined) parts.push(`${mwi.isZh ? '成交价缓存' : 'Price Cached'} ${status.cachedDays}${mwi.isZh ? '天' : 'd'}`);
+      if (status.cachedVolumeDays !== undefined) parts.push(`${mwi.isZh ? '成交量缓存' : 'Vol Cached'} ${status.cachedVolumeDays}${mwi.isZh ? '天' : 'd'}`);
+      if (status.totalPoints !== undefined) parts.push(`${mwi.isZh ? '数据点' : 'Points'} ${showNumber(status.totalPoints)}`);
+      if (preloadState.running && preloadState.displayTotal > 0) {
+        parts.push(`${mwi.isZh ? '已缓存物品数' : 'Cached Items'} ${preloadState.displayDone}/${preloadState.displayTotal}`);
+      }
+      chartStatusBar.innerHTML = parts.map(text => `<span>${text}</span>`).join('');
     }
     
     //data={'bid':[{time:1,price:1}],'ask':[{time:1,price:1}]}
@@ -3986,15 +4663,13 @@
         chart.data.labels = [];
         chart.data.datasets = [];
         metricBar.innerHTML = '';
+        renderChartStatus({});
 
-        renderInsightPanel(buildMarketInsight({
+        renderInsightPanel(buildMarketSummary({
           lastBid: null,
           lastAsk: null,
           lastMid: null,
-          lastVol: 0,
-          ma5: null,
-          ma10: null,
-          ma20: null,
+          dayVolumeTotal: 0,
           bidPct: currentOrderBook.bidPct,
           askPct: currentOrderBook.askPct,
           bidTotal: currentOrderBook.bidTotal,
@@ -4015,12 +4690,18 @@
           continue;
         }
 
-        if (bidItem.price < 0 && askItem.price < 0) {
+        const bidPrice = Number(bidItem.price);
+        const askPrice = Number(askItem.price);
+
+        if (
+          (!Number.isFinite(bidPrice) || bidPrice <= 0) &&
+          (!Number.isFinite(askPrice) || askPrice <= 0)
+        ) {
           data.bid.splice(i, 1);
           data.ask.splice(i, 1);
         } else {
-          bidItem.price = Math.max(0, bidItem.price || 0);
-          askItem.price = Math.max(0, askItem.price || 0);
+          bidItem.price = Number.isFinite(bidPrice) && bidPrice > 0 ? bidPrice : null;
+          askItem.price = Number.isFinite(askPrice) && askPrice > 0 ? askPrice : null;
         }
       }
 
@@ -4048,7 +4729,7 @@
           bidItem.volume ??
           askItem.v ??
           bidItem.v ??
-          0;
+          null;
         volumeSeries.push(volume);
 
         if (bid != null && ask != null) {
@@ -4062,10 +4743,6 @@
         }
       }
 
-      const ma5 = calcMA(midSeries, 5);
-      const ma10 = calcMA(midSeries, 10);
-      const ma20 = calcMA(midSeries, 20);
-
       const lastValid = arr => {
         for (let i = arr.length - 1; i >= 0; i--) {
           if (arr[i] != null && !isNaN(arr[i])) return arr[i];
@@ -4077,36 +4754,48 @@
       const lastAsk = lastValid(askSeries);
       const lastVol = lastValid(volumeSeries);
       const lastMid = lastValid(midSeries);
-
       const lastSpread = (lastAsk != null && lastBid != null) ? (lastAsk - lastBid) : null;
       const lastSpreadPct = (lastSpread != null && lastMid) ? (lastSpread / lastMid * 100) : null;
+      const latestLabelDate = labels.length > 0 ? labels[labels.length - 1] : null;
+      const latestDayKey = latestLabelDate
+        ? `${latestLabelDate.getFullYear()}-${latestLabelDate.getMonth()}-${latestLabelDate.getDate()}`
+        : null;
+      const dayVolumeTotal = volumeSeries.reduce((sum, volume, index) => {
+        const pointDate = labels[index];
+        if (!pointDate || latestDayKey === null) return sum;
+        const pointDayKey = `${pointDate.getFullYear()}-${pointDate.getMonth()}-${pointDate.getDate()}`;
+        return pointDayKey === latestDayKey ? sum + (Number(volume) || 0) : sum;
+      }, 0);
+      const latestDayHasVolume = volumeSeries.some((volume, index) => {
+        const pointDate = labels[index];
+        if (!pointDate || latestDayKey === null) return false;
+        const pointDayKey = `${pointDate.getFullYear()}-${pointDate.getMonth()}-${pointDate.getDate()}`;
+        return pointDayKey === latestDayKey && volume != null;
+      });
+      const dayVolumeDisplay = latestDayHasVolume ? dayVolumeTotal : (mwi.isZh ? '未获取' : 'N/A');
+      const historyStats = data?.stats || {};
 
       metricBar.innerHTML = `
         <span style="color:#00c087;">买一 ${showNumber(lastBid ?? '-')}</span>
         <span style="color:#ff4d4f;">卖一 ${showNumber(lastAsk ?? '-')}</span>
         <span style="color:#c8d1dc;">价差 ${showNumber(lastSpread ?? '-')}</span>
-        <span style="color:#8fb3d9;">Spread ${lastSpreadPct != null ? lastSpreadPct.toFixed(2) + '%' : '-'}</span>
-        <span style="color:rgba(255,255,255,0.72);">成交量 ${showNumber(lastVol ?? '-')}</span>
-        <span style="color:#ffffff;">MA5 ${showNumber(lastValid(ma5) ?? '-')}</span>
-        <span style="color:rgb(120,180,255);">MA10 ${showNumber(lastValid(ma10) ?? '-')}</span>
-        <span style="color:rgb(255,210,120);">MA20 ${showNumber(lastValid(ma20) ?? '-')}</span>
+        <span style="color:rgba(255,255,255,0.72);">${mwi.isZh ? '今日成交量' : 'Today Vol'} ${showNumber(dayVolumeDisplay)}</span>
       `;
 
-      const insight = buildMarketInsight({
+      renderChartStatus(historyStats);
+
+      const summary = buildMarketSummary({
         lastBid,
         lastAsk,
         lastMid,
-        lastVol,
-        ma5: lastValid(ma5),
-        ma10: lastValid(ma10),
-        ma20: lastValid(ma20),
+        dayVolumeTotal: dayVolumeDisplay,
         bidPct: currentOrderBook.bidPct,
         askPct: currentOrderBook.askPct,
         bidTotal: currentOrderBook.bidTotal,
         askTotal: currentOrderBook.askTotal
       });
 
-      renderInsightPanel(insight);
+      renderInsightPanel(summary);
 
       const allPriceSeries = [
         ...bidSeries,
@@ -4128,7 +4817,7 @@
           backgroundColor: '#00c087',
           borderWidth: 2,
           pointRadius: 0,
-          spanGaps: true,
+          spanGaps: false,
           order: 1
         },
         {
@@ -4140,7 +4829,7 @@
           backgroundColor: '#ff4d4f',
           borderWidth: 2,
           pointRadius: 0,
-          spanGaps: true,
+          spanGaps: false,
           order: 1
         },
         {
@@ -4167,14 +4856,15 @@
         return;//铁牛不保存
       }
 
-      if (chart && chart.data && chart.data.datasets/* && chart.data.datasets.length == 3 */) {
+      if (chart && chart.data && chart.data.datasets) {
         config.filter.ask = chart.getDatasetMeta(0).visible;
         config.filter.bid = chart.getDatasetMeta(1).visible;
-        config.filter.mean = chart.getDatasetMeta(2).visible;
+        config.filter.volume = chart.getDatasetMeta(2).visible;
       }
       if (container.checkVisibility()) {
-        config.x = Math.max(0, Math.min(container.getBoundingClientRect().x, window.innerWidth - 50));
-        config.y = Math.max(0, Math.min(container.getBoundingClientRect().y, window.innerHeight - 50));
+        const rect = container.getBoundingClientRect();
+        config.x = Math.round(rect.x);
+        config.y = Math.round(rect.y);
 
         if (uiContainer.style.display === 'none') {
           config.minWidth = container.offsetWidth;
@@ -4240,11 +4930,21 @@
                   btn_favo.style.padding = "0";
                   btn_favo.style.fontSize = "18px";
                   btn_favo.style.marginLeft = "32px";
-                  btn_favo.title = mwi.isZh ? "添加到自选" : "Add favorite";
+                  btn_favo.title = mwi.isZh ? "左键添加到自选，右键当前物品也可添加" : "Left click to add favorite, or right click the current item";
                   btn_favo.onclick = () => { if (btn_favo.itemHridLevel) addFavo(btn_favo.itemHridLevel) };
                   currentItem.prepend(btn_favo);
                 }
                 btn_favo.itemHridLevel = itemHridLevel;
+                currentItem.dataset.mooketItemHridLevel = itemHridLevel;
+                currentItem.title = mwi.isZh ? "右键添加到自选" : "Right click to add favorite";
+                if (!currentItem.dataset.mooketContextMenuBound) {
+                  currentItem.dataset.mooketContextMenuBound = "1";
+                  currentItem.addEventListener("contextmenu", (event) => {
+                    event.preventDefault();
+                    let targetItemHridLevel = currentItem.dataset.mooketItemHridLevel;
+                    if (targetItemHridLevel) addFavo(targetItemHridLevel);
+                  });
+                }
               }
               //记录当前
               lastItemHridLevel = itemHridLevel;
@@ -4262,16 +4962,22 @@
     }, 500);
     //setInterval(updateInventoryStatus, 60000);
     toggleShow(config.visible);
+    keepToggleButtonVisible();
+    startFullHistoryWarmup();
+    setInterval(() => { startFullHistoryWarmup(); }, 1000 * 600);
 
-    fillMockOrderBook();
-    renderInsightPanel(buildMarketInsight({
+    updateOrderBook({
+      itemHrid: null,
+      level: 0,
+      orderBook: { asks: [], bids: [] },
+      updatedAt: 0
+    });
+    renderChartStatus({});
+    renderInsightPanel(buildMarketSummary({
       lastBid: null,
       lastAsk: null,
       lastMid: null,
-      lastVol: 0,
-      ma5: null,
-      ma10: null,
-      ma20: null,
+      dayVolumeTotal: 0,
       bidPct: currentOrderBook.bidPct,
       askPct: currentOrderBook.askPct
     }));

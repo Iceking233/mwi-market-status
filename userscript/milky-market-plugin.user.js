@@ -3319,7 +3319,7 @@
     leftContainer.style.background = 'transparent';
     uiContainer.appendChild(leftContainer);
 
-    const days = [1, 3, 7, 20, 60, 180];
+    const days = [1, 3, 7, 20, 60, 180, 365];
     if (typeof config.dayIndex !== "number" || config.dayIndex < 0 || config.dayIndex >= days.length) {
     config.dayIndex = 0;
     }
@@ -3372,7 +3372,7 @@
     }
 
     function updateMoodays() {
-    const labels = mwi.isZh ? ["1天", "3天", "7天", "20天", "60天", "180天"] : ["1D", "3D", "7D", "20D", "60D", "180D"];
+    const labels = mwi.isZh ? ["1天", "3天", "7天", "20天", "60天", "180天", "365天"] : ["1D", "3D", "7D", "20D", "60D", "180D", "365D"];
     for (let i = 0; i < select.options.length; i++) {
     select.options[i].text = labels[i];
     }
@@ -3490,7 +3490,7 @@
 
     const chartStatusBar = document.createElement('div');
     chartStatusBar.id = 'mooket_chart_status';
-    chartStatusBar.style.display = 'flex';
+    chartStatusBar.style.display = 'none';
     chartStatusBar.style.flexWrap = 'wrap';
     chartStatusBar.style.gap = '8px 12px';
     chartStatusBar.style.padding = '0 0 8px 0';
@@ -4264,7 +4264,8 @@
           time: {
             displayFormats: {
               hour: 'HH:mm',
-              day: 'MM/dd'
+              day: 'MM/dd',
+              month: 'yy/MM'
             }
           },
           grid: {
@@ -4276,7 +4277,10 @@
             maxTicksLimit: 10,
             maxRotation: 0,
             minRotation: 0,
-            padding: 8
+            padding: 8,
+            callback: function(value) {
+              return formatAxisTime(value, curDay);
+            }
           }
         },
         y: {
@@ -4313,6 +4317,10 @@
             titleColor: '#ffffff',
             bodyColor: '#d7dde6',
             callbacks: {
+              title: function(context) {
+                const xValue = context?.[0]?.parsed?.x;
+                return formatTooltipTime(xValue);
+              },
               label: function(context) {
                 const label = context.dataset.label || '';
                 const value = context.parsed.y;
@@ -4758,35 +4766,38 @@
       tryReadOrderBook(1);
     }
 
-    function formatTime(timestamp, range) {
-      const date = new Date(timestamp * 1000);
-      const pad = n => n.toString().padStart(2, '0');
+    function pad2(value) {
+      return String(value).padStart(2, '0');
+    }
 
-      // 获取各时间组件
-      const hours = pad(date.getHours());
-      const minutes = pad(date.getMinutes());
-      const day = pad(date.getDate());
-      const month = pad(date.getMonth() + 1);
-      const year = date.getFullYear().toString();
-      const shortYear = year.slice(-2);
-
-      // 根据时间范围选择格式
-      switch (parseInt(range)) {
-        case 1:
-        case 3:
-          return `${hours}:${minutes}`;
-
-        case 7:
-        case 20:
-          return `${month}/${day} ${hours}:${minutes}`;
-
-        case 60:
-        case 180:
-          return `${shortYear}/${month}/${day}`;
-
-        default:
-          return `${shortYear}/${month}/${day}`;
+    function normalizeDateInput(value) {
+      if (value instanceof Date) return value;
+      if (typeof value === "number") {
+        return new Date(value > 1e12 ? value : value * 1000);
       }
+      return new Date(value);
+    }
+
+    function formatAxisTime(value, range) {
+      const date = normalizeDateInput(value);
+      if (Number.isNaN(date.getTime())) return '';
+      const hours = pad2(date.getHours());
+      const minutes = pad2(date.getMinutes());
+      const day = date.getDate();
+      const month = date.getMonth() + 1;
+      const shortYear = String(date.getFullYear()).slice(-2);
+
+      if (Number(range) <= 3) return `${hours}:${minutes}`;
+      if (Number(range) <= 20) return `${month}月${day}日 ${hours}:${minutes}`;
+      return `${shortYear}年${month}月`;
+    }
+
+    function formatTooltipTime(value) {
+      const date = normalizeDateInput(value);
+      if (Number.isNaN(date.getTime())) return '';
+      const hours = pad2(date.getHours());
+      const minutes = pad2(date.getMinutes());
+      return `${date.getFullYear()}.${date.getMonth() + 1}.${date.getDate()} ${hours}:${minutes}`;
     }
 
     function showNumber(num) {
@@ -4843,15 +4854,8 @@
       };
     }
 
-    function renderChartStatus(status = {}) {
-      const parts = [];
-      if (status.cachedDays !== undefined) parts.push(`${mwi.isZh ? '成交价缓存' : 'Price Cached'} ${status.cachedDays}${mwi.isZh ? '天' : 'd'}`);
-      if (status.cachedVolumeDays !== undefined) parts.push(`${mwi.isZh ? '成交量缓存' : 'Vol Cached'} ${status.cachedVolumeDays}${mwi.isZh ? '天' : 'd'}`);
-      if (status.totalPoints !== undefined) parts.push(`${mwi.isZh ? '数据点' : 'Points'} ${showNumber(status.totalPoints)}`);
-      if (preloadState.running && preloadState.displayTotal > 0) {
-        parts.push(`${mwi.isZh ? '已缓存物品数' : 'Cached Items'} ${preloadState.displayDone}/${preloadState.displayTotal}`);
-      }
-      chartStatusBar.innerHTML = parts.map(text => `<span>${text}</span>`).join('');
+    function renderChartStatus() {
+      chartStatusBar.innerHTML = '';
     }
     
     //data={'bid':[{time:1,price:1}],'ask':[{time:1,price:1}]}

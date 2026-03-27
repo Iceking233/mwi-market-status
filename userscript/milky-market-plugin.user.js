@@ -2348,7 +2348,7 @@
   const HOST = "https://mooket.qi-e.top";
   const MWIAPI_URL = `${HOST}/market/api.json`;
   const THIRD_PARTY_HISTORY_URL = "https://q7.nainai.eu.org/api/market/history";
-  const SQLITE_HISTORY_MANIFEST_URL = `${HOST}/market/history/sqlite/manifest.json`;
+  const SQLITE_HISTORY_MANIFEST_URL = "https://iceking233.github.io/mwi-market-status/history/sqlite/manifest.json";
   const HISTORY_DB_NAME = "MWIHistoryDB";
   const HISTORY_DB_VERSION = 1;
   const THIRD_PARTY_MAX_DAYS = 18;
@@ -2359,6 +2359,9 @@
     value: null,
     fetchedAt: 0,
     inflight: null
+  };
+  const historyDebugState = {
+    lastChartSignature: null
   };
 
   class MarketHistoryStore {
@@ -2545,6 +2548,7 @@
         const request = index.getAll(range);
         request.onsuccess = () => {
           const rows = (request.result || []).sort((a, b) => a.time - b.time);
+          const sourceSummary = summarizeHistorySources(rows);
           const historicalVolumeRows = rows.filter(row =>
             row.volume != null &&
             Number(row.volume) >= 0 &&
@@ -2555,7 +2559,10 @@
             cachedVolumeDays: Math.min(THIRD_PARTY_MAX_DAYS, countContinuousDays(historicalVolumeRows)),
             totalPoints: rows.length,
             earliestTime: rows[0]?.time ?? null,
-            latestTime: rows[rows.length - 1]?.time ?? null
+            latestTime: rows[rows.length - 1]?.time ?? null,
+            dominantSource: sourceSummary.dominantSource,
+            sourceLabels: sourceSummary.labels,
+            sourceCounts: sourceSummary.counts
           });
         };
         request.onerror = () => reject(request.error);
@@ -2649,9 +2656,27 @@
   }
 
   function resolveSqliteHistoryManifestEntry(manifest, itemHridName) {
+    if (!manifest?.items || !itemHridName) return null;
+
     const normalizedKey = mwi.ensureItemHrid(itemHridName) || itemHridName;
-    if (!manifest?.items || !normalizedKey) return null;
-    return manifest.items[normalizedKey] || manifest.items[itemHridName] || null;
+    const englishName = normalizedKey?.startsWith("/items/")
+      ? mwi.lang?.en?.translation?.itemNames?.[normalizedKey]
+      : null;
+    const chineseName = normalizedKey?.startsWith("/items/")
+      ? mwi.lang?.zh?.translation?.itemNames?.[normalizedKey]
+      : null;
+
+    const lookupKeys = [
+      normalizedKey,
+      itemHridName,
+      englishName,
+      chineseName
+    ].filter(Boolean);
+
+    for (const key of lookupKeys) {
+      if (manifest.items[key]) return manifest.items[key];
+    }
+    return null;
   }
 
   function normalizeSqliteHistoryRows(payloadRows) {
@@ -2662,6 +2687,162 @@
       p: row.p ?? row.price ?? null,
       v: row.v ?? row.volume ?? null
     })).filter(row => row.time > 0);
+  }
+
+  function summarizeHistorySources(rows) {
+    const counts = {};
+    (rows || []).forEach(row => {
+      const source = row?.source || "unknown";
+      counts[source] = (counts[source] || 0) + 1;
+    });
+    const entries = Object.entries(counts).sort((left, right) => right[1] - left[1]);
+    return {
+      counts,
+      labels: entries.map(([source, count]) => `${source}:${count}`),
+      dominantSource: entries[0]?.[0] || null
+    };
+  }
+
+  function logHistoryDebug(label, payload = {}) {
+    console.info(`[mooket][history] ${label}`, payload);
+  }
+
+  function createProbeTimeoutController(timeoutMs = 8000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    return {
+      controller,
+      cleanup: () => clearTimeout(timer)
+    };
+  }
+
+  async function probeJsonEndpoint(label, url, validate) {
+    const { controller, cleanup } = createProbeTimeoutController();
+    const startedAt = Date.now();
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        signal: controller.signal,
+        cache: "no-store"
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json();
+      const detail = validate ? validate(payload) : null;
+      return {
+        label,
+        ok: true,
+        url,
+        ms: Date.now() - startedAt,
+        detail: detail || "ok"
+      };
+    } catch (error) {
+      return {
+        label,
+        ok: false,
+        url,
+        ms: Date.now() - startedAt,
+        detail: error?.name === "AbortError" ? "timeout" : (error?.message || String(error))
+      };
+    } finally {
+      cleanup();
+    }
+  }
+
+  async function runStartupHealthChecks() {
+    const sampleItemHrid = "/items/apple";
+    const sampleItemName = mwi.lang?.en?.translation?.itemNames?.[sampleItemHrid] || "Apple";
+    const sqliteManifest = await probeJsonEndpoint(
+      "sqlite_manifest",
+      SQLITE_HISTORY_MANIFEST_URL,
+      payload => {
+        const itemCount = Object.keys(payload?.items || {}).length;
+        if (!itemCount) throw new Error("manifest items empty");
+        return `items=${itemCount}`;
+      }
+    );
+
+    let sqliteShard = {
+      label: "sqlite_shard",
+      ok: false,
+      url: "",
+      ms: 0,
+      detail: "manifest unavailable"
+    };
+    if (sqliteManifest.ok) {
+      try {
+        const manifest = await fetchSqliteHistoryManifest();
+        const entry = resolveSqliteHistoryManifestEntry(manifest, sampleItemHrid) ||
+          resolveSqliteHistoryManifestEntry(manifest, sampleItemName) ||
+          Object.values(manifest?.items || {})[0];
+        if (entry?.path) {
+          const shardUrl = toAbsoluteUrl(entry.path, SQLITE_HISTORY_MANIFEST_URL);
+          sqliteShard = await probeJsonEndpoint(
+            "sqlite_shard",
+            shardUrl,
+            payload => {
+              const rows = normalizeSqliteHistoryRows(payload?.rows || payload);
+              if (!rows.length) throw new Error("rows empty");
+              return `rows=${rows.length}`;
+            }
+          );
+        } else {
+          sqliteShard.detail = "manifest entry missing";
+        }
+      } catch (error) {
+        sqliteShard.detail = error?.message || String(error);
+      }
+    }
+
+    const checks = await Promise.all([
+      Promise.resolve(sqliteManifest),
+      Promise.resolve(sqliteShard),
+      probeJsonEndpoint(
+        "official_market_api",
+        MWIAPI_URL,
+        payload => {
+          const itemCount = Object.keys(payload?.marketData || {}).length;
+          if (!payload?.timestamp || !itemCount) throw new Error("marketData empty");
+          return `items=${itemCount}`;
+        }
+      ),
+      probeJsonEndpoint(
+        "third_party_history",
+        `${THIRD_PARTY_HISTORY_URL}?item_id=${encodeURIComponent(sampleItemHrid)}&variant=0&days=1`,
+        payload => {
+          const rows = Array.isArray(payload) ? payload : payload?.data || payload?.rows || [];
+          if (!Array.isArray(rows)) throw new Error("payload invalid");
+          return `rows=${rows.length}`;
+        }
+      ),
+      probeJsonEndpoint(
+        "legacy_history",
+        `${HOST}/market/item/history?name=${encodeURIComponent(sampleItemHrid)}&level=0&time=86400`,
+        payload => {
+          const bidRows = payload?.bid || payload?.bids || [];
+          const askRows = payload?.ask || payload?.asks || [];
+          if (!Array.isArray(bidRows) || !Array.isArray(askRows)) throw new Error("payload invalid");
+          return `bid=${bidRows.length},ask=${askRows.length}`;
+        }
+      )
+    ]);
+
+    const summary = checks.reduce((accumulator, check) => {
+      accumulator[check.label] = {
+        ok: check.ok,
+        ms: check.ms,
+        detail: check.detail,
+        url: check.url
+      };
+      return accumulator;
+    }, {});
+
+    console.groupCollapsed("mooket startup health checks");
+    console.table(summary);
+    checks.forEach(check => {
+      const prefix = check.ok ? "[OK]" : "[FAIL]";
+      console[check.ok ? "info" : "warn"](`${prefix} ${check.label} ${check.ms}ms ${check.detail} ${check.url}`);
+    });
+    console.groupEnd();
   }
 
   class CoreMarket {
@@ -4212,6 +4393,12 @@
       }
 
       await marketHistoryStore.saveHistorySeries(itemHridName, level, rows, "third_party_history", { days: day });
+      logHistoryDebug("third_party_history imported", {
+        itemHrid: itemHridName,
+        level: Number(level) || 0,
+        day: Number(day) || 1,
+        rows: rows.length
+      });
       return rows;
       })();
 
@@ -4250,6 +4437,13 @@
           "sqlite_history",
           { days: Number(entry.maxDays || day) || day }
         );
+        logHistoryDebug("sqlite_history imported", {
+          itemHrid: itemHridName,
+          level: Number(level) || 0,
+          day: Number(day) || 1,
+          rows: rows.length,
+          shard: entry.path
+        });
         return rows;
       })();
 
@@ -4466,6 +4660,12 @@
               }
               if (fallbackRows.length > 0) {
                 await marketHistoryStore.saveHistorySeries(curHridName, curLevel, fallbackRows, "legacy_history", { days: day });
+                logHistoryDebug("legacy_history imported", {
+                  itemHrid: curHridName,
+                  level: Number(curLevel) || 0,
+                  day: Number(day) || 1,
+                  rows: fallbackRows.length
+                });
                 const mergedRows = await marketHistoryStore.queryHistory(curHridName, curLevel, day);
                 const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
                 updateChart(marketHistoryStore.toChartData(mergedRows, stats, day), curDay);
@@ -4774,6 +4974,26 @@
       });
       const dayVolumeDisplay = latestDayHasVolume ? dayVolumeTotal : (mwi.isZh ? '未获取' : 'N/A');
       const historyStats = data?.stats || {};
+      const chartSignature = [
+        curHridName,
+        Number(curLevel) || 0,
+        Number(day) || 0,
+        historyStats.totalPoints || 0,
+        historyStats.dominantSource || "none",
+        (historyStats.sourceLabels || []).join("|")
+      ].join("::");
+      if (historyDebugState.lastChartSignature !== chartSignature) {
+        historyDebugState.lastChartSignature = chartSignature;
+        logHistoryDebug("chart dataset ready", {
+          itemHrid: curHridName,
+          level: Number(curLevel) || 0,
+          day: Number(day) || 1,
+          totalPoints: historyStats.totalPoints || 0,
+          cachedDays: historyStats.cachedDays || 0,
+          dominantSource: historyStats.dominantSource || null,
+          sources: historyStats.sourceLabels || []
+        });
+      }
 
       metricBar.innerHTML = `
         <span style="color:#00c087;">买一 ${showNumber(lastBid ?? '-')}</span>
@@ -4983,6 +5203,9 @@
     }));
 
     console.info("mooket 初始化完成");
+    runStartupHealthChecks().catch(error => {
+      console.warn("mooket startup health checks failed", error);
+    });
   }
   new Promise(resolve => {
     let count = 0;

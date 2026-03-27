@@ -1,9 +1,13 @@
 // ==UserScript==
-// @name         mooket ultra local test
+// @name         SUPER mooket
 // @namespace    local.mooket.ultra.test
 // @version      20260327
-// @description  银河奶牛历史价格（本地测试版）
-// @author       IOMisaka + Iceking233
+// @description  银河奶牛历史价格
+// @author       Iceking233
+// @thanks       1. 感谢mooket作者IOMisaka，本插件在mooket的基础上开发，提供了更多功能和更好的用户体验！
+// @thanks       2. 感谢mooket 2作者Q7，提供历史数据成交量接口！
+// @thanks       3. 感谢MWI Api作者holychikenz，提供了历史数据库！
+// @thanks       4. 感谢Joey、Baozhi、ColaCola、Hyh_fish的测试和大力支持！
 // @match        https://www.milkywayidle.com/*
 // @match        https://www.milkywayidlecn.com/*
 // @icon         https://www.milkywayidle.com/favicon.svg

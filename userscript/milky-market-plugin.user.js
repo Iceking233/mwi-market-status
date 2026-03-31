@@ -2389,8 +2389,8 @@
   function formatSourceNoticeText(detail) {
     if (!detail) return "";
     const baseMessage = mwi.isZh
-      ? "数据来源由于网络原因无法访问"
-      : "Market data source is not reachable due to network restrictions";
+      ? "首选数据源当前不可用"
+      : "Preferred data source is currently unavailable";
     const suffix = detail.fallback
       ? (mwi.isZh ? `，当前已降级到${detail.fallback}` : `, currently using ${detail.fallback}`)
       : (mwi.isZh ? "，当前只能使用本地缓存" : ", currently using local cache only");
@@ -4837,9 +4837,7 @@
             }
             if (fallbackRows.length > 0) {
               await marketHistoryStore.saveHistorySeries(curHridName, curLevel, fallbackRows, "legacy_history", { days: day });
-              setSourceNotice("history", {
-                fallback: mwi.isZh ? "旧历史接口" : "legacy history API"
-              });
+              setSourceNotice("history", null);
               const mergedRows = await marketHistoryStore.queryHistory(curHridName, curLevel, day);
               const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
               updateChart(marketHistoryStore.toChartData(mergedRows, stats, day), curDay);

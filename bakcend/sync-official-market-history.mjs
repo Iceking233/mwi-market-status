@@ -136,6 +136,42 @@ function mergeRow(rows, nextRow) {
   return rows;
 }
 
+function buildPublicHistoryManifest(manifest) {
+  const publicManifest = JSON.parse(JSON.stringify(manifest || {}));
+  if (publicManifest?.latestSnapshot?.path) {
+    publicManifest.latestSnapshot.path = `../../../history/official/${publicManifest.latestSnapshot.path}`;
+  }
+
+  Object.values(publicManifest?.items || {}).forEach(itemEntry => {
+    Object.values(itemEntry?.variants || {}).forEach(variantEntry => {
+      if (variantEntry?.path) {
+        variantEntry.path = `../../../history/official/${variantEntry.path}`;
+      }
+    });
+  });
+
+  return publicManifest;
+}
+
+function buildPublicMarketManifest(manifest) {
+  return {
+    version: 1,
+    generatedAt: manifest.generatedAt,
+    sourceName: manifest.sourceName,
+    latestSnapshot: manifest.latestSnapshot?.path
+      ? {
+          ...manifest.latestSnapshot,
+          path: `../history/official/${manifest.latestSnapshot.path}`
+        }
+      : manifest.latestSnapshot,
+    endpoints: {
+      latestMarketApi: "api.json",
+      officialHistoryManifest: "history/official/manifest.json",
+      sqliteHistoryManifest: "../history/sqlite/manifest.json"
+    }
+  };
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const snapshotsDir = path.join(args.outDir, "snapshots");
@@ -183,20 +219,10 @@ async function main() {
     await fs.writeFile(publicApiPath, `${JSON.stringify(snapshot.payload)}\n`, "utf8");
     await fs.writeFile(
       publicManifestPath,
-      `${JSON.stringify({
-        version: 1,
-        generatedAt: manifest.generatedAt,
-        sourceName: manifest.sourceName,
-        latestSnapshot: manifest.latestSnapshot,
-        endpoints: {
-          latestMarketApi: "market/api.json",
-          officialHistoryManifest: "history/official/manifest.json",
-          sqliteHistoryManifest: "history/sqlite/manifest.json"
-        }
-      })}\n`,
+      `${JSON.stringify(buildPublicMarketManifest(manifest))}\n`,
       "utf8"
     );
-    await fs.writeFile(publicHistoryManifestPath, `${JSON.stringify(manifest)}\n`, "utf8");
+    await fs.writeFile(publicHistoryManifestPath, `${JSON.stringify(buildPublicHistoryManifest(manifest))}\n`, "utf8");
     console.log(`Snapshot ${snapshot.timestamp} already imported, skipped shard rewrite`);
     return;
   }
@@ -254,20 +280,10 @@ async function main() {
 
   await fs.writeFile(manifestPath, `${JSON.stringify(manifest)}\n`, "utf8");
   await fs.writeFile(publicApiPath, `${JSON.stringify(snapshot.payload)}\n`, "utf8");
-  await fs.writeFile(publicHistoryManifestPath, `${JSON.stringify(manifest)}\n`, "utf8");
+  await fs.writeFile(publicHistoryManifestPath, `${JSON.stringify(buildPublicHistoryManifest(manifest))}\n`, "utf8");
   await fs.writeFile(
     publicManifestPath,
-    `${JSON.stringify({
-      version: 1,
-      generatedAt: manifest.generatedAt,
-      sourceName: args.sourceName,
-      latestSnapshot: manifest.latestSnapshot,
-      endpoints: {
-        latestMarketApi: "market/api.json",
-        officialHistoryManifest: "history/official/manifest.json",
-        sqliteHistoryManifest: "history/sqlite/manifest.json"
-      }
-    })}\n`,
+    `${JSON.stringify(buildPublicMarketManifest(manifest))}\n`,
     "utf8"
   );
 

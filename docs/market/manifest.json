@@ -1,0 +1,1 @@
+{"version":1,"generatedAt":"2026-03-31T09:05:11.984Z","sourceName":"official_market_api","latestSnapshot":{"timestamp":1774946264,"path":"snapshots/2026/03/31/1774946264.json"},"endpoints":{"latestMarketApi":"market/api.json","officialHistoryManifest":"history/official/manifest.json","sqliteHistoryManifest":"history/sqlite/manifest.json"}}

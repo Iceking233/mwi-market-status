@@ -2617,10 +2617,13 @@
           ask: null,
           volume: null
         };
-        if (Number.isFinite(Number(row.bid)) && Number(row.bid) >= 0) point.bid = Number(row.bid);
-        if (Number.isFinite(Number(row.ask)) && Number(row.ask) >= 0) point.ask = Number(row.ask);
-        if (row.volume != null && Number.isFinite(Number(row.volume)) && Number(row.volume) >= 0) {
-          point.volume = point.volume == null ? Number(row.volume) : Math.max(point.volume, Number(row.volume));
+        const rowBid = row.bid ?? row.b;
+        const rowAsk = row.ask ?? row.a;
+        const rowVolume = row.volume ?? row.v;
+        if (Number.isFinite(Number(rowBid)) && Number(rowBid) >= 0) point.bid = Number(rowBid);
+        if (Number.isFinite(Number(rowAsk)) && Number(rowAsk) >= 0) point.ask = Number(rowAsk);
+        if (rowVolume != null && Number.isFinite(Number(rowVolume)) && Number(rowVolume) >= 0) {
+          point.volume = point.volume == null ? Number(rowVolume) : Math.max(point.volume, Number(rowVolume));
         }
         pointsByTime.set(time, point);
       });
@@ -3681,6 +3684,27 @@
     ctx.id = "mooket_chart";
     chartWrap.appendChild(ctx);
 
+    const externalTooltip = document.createElement('div');
+    externalTooltip.id = 'mooket_chart_tooltip';
+    externalTooltip.style.position = 'fixed';
+    externalTooltip.style.left = '0';
+    externalTooltip.style.top = '0';
+    externalTooltip.style.display = 'none';
+    externalTooltip.style.pointerEvents = 'none';
+    externalTooltip.style.zIndex = '2147483647';
+    externalTooltip.style.maxWidth = '280px';
+    externalTooltip.style.padding = '10px 12px';
+    externalTooltip.style.borderRadius = '12px';
+    externalTooltip.style.border = '1px solid #343b48';
+    externalTooltip.style.background = 'rgba(27,32,40,0.97)';
+    externalTooltip.style.boxShadow = '0 12px 30px rgba(0,0,0,0.35)';
+    externalTooltip.style.color = '#d7dde6';
+    externalTooltip.style.fontSize = '12px';
+    externalTooltip.style.lineHeight = '1.45';
+    externalTooltip.style.whiteSpace = 'nowrap';
+    externalTooltip.style.backdropFilter = 'blur(6px)';
+    document.body.appendChild(externalTooltip);
+
     // 右侧自选
     let favoContainer = document.createElement('div');
     favoContainer.id = "mooket_favo_panel";
@@ -4409,6 +4433,64 @@
       renderOrderBook(currentOrderBook);
     }
 
+    function hideExternalTooltip() {
+      externalTooltip.style.display = 'none';
+      externalTooltip.innerHTML = '';
+    }
+
+    function renderExternalTooltip(context) {
+      const tooltipModel = context?.tooltip;
+      if (!tooltipModel || tooltipModel.opacity === 0 || !tooltipModel.dataPoints?.length) {
+        hideExternalTooltip();
+        return;
+      }
+
+      const title = tooltipModel.title?.[0] || '';
+      const rows = tooltipModel.dataPoints.map(point => {
+        const color = point.dataset?.borderColor || point.dataset?.backgroundColor || '#d7dde6';
+        const label = point.dataset?.label || '';
+        const value = showNumber(point.parsed?.y ?? point.raw ?? '-');
+        return `
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span style="width:10px;height:10px;border-radius:2px;background:${color};box-shadow:0 0 0 2px rgba(255,255,255,0.12) inset;"></span>
+            <span style="color:#d7dde6;">${label}: ${value}</span>
+          </div>
+        `;
+      }).join('');
+
+      externalTooltip.innerHTML = `
+        <div style="font-size:13px;font-weight:700;color:#ffffff;margin-bottom:${rows ? '8px' : '0'};">${title}</div>
+        <div style="display:flex;flex-direction:column;gap:4px;">${rows}</div>
+      `;
+      externalTooltip.style.display = 'block';
+
+      const canvasRect = context.chart.canvas.getBoundingClientRect();
+      const viewportPadding = 12;
+      const offsetX = 18;
+      const offsetY = 10;
+      const tooltipRect = externalTooltip.getBoundingClientRect();
+
+      let left = canvasRect.left + tooltipModel.caretX + offsetX;
+      let top = canvasRect.top + tooltipModel.caretY - tooltipRect.height - offsetY;
+
+      if (left + tooltipRect.width > window.innerWidth - viewportPadding) {
+        left = canvasRect.left + tooltipModel.caretX - tooltipRect.width - offsetX;
+      }
+      if (left < viewportPadding) {
+        left = viewportPadding;
+      }
+
+      if (top < viewportPadding) {
+        top = canvasRect.top + tooltipModel.caretY + offsetY;
+      }
+      if (top + tooltipRect.height > window.innerHeight - viewportPadding) {
+        top = Math.max(viewportPadding, window.innerHeight - tooltipRect.height - viewportPadding);
+      }
+
+      externalTooltip.style.left = `${Math.round(left)}px`;
+      externalTooltip.style.top = `${Math.round(top)}px`;
+    }
+
     let chart = new Chart(ctx, {
       type: 'bar',
       data: {
@@ -4484,6 +4566,8 @@
       },
         plugins: {
           tooltip: {
+            enabled: false,
+            external: renderExternalTooltip,
             mode: 'index',
             intersect: false,
             backgroundColor: '#1b2028',
@@ -4966,27 +5050,6 @@
       data.bid = data.bid || data.bids || [];
       data.ask = data.ask || data.asks || [];
 
-      if (!data.bid.length || !data.ask.length) {
-        chart.data.labels = [];
-        chart.data.datasets = [];
-        metricBar.innerHTML = '';
-        renderChartStatus({});
-
-        renderInsightPanel(buildMarketSummary({
-          lastBid: null,
-          lastAsk: null,
-          lastMid: null,
-          dayVolumeTotal: 0,
-          bidPct: currentOrderBook.bidPct,
-          askPct: currentOrderBook.askPct,
-          bidTotal: currentOrderBook.bidTotal,
-          askTotal: currentOrderBook.askTotal
-        }));
-
-        chart.update();
-        return;
-      }
-
       for (let i = data.bid.length - 1; i >= 0; i--) {
         const bidItem = data.bid[i];
         const askItem = data.ask[i];
@@ -5013,6 +5076,28 @@
       }
 
       const len = Math.min(data.bid.length, data.ask.length);
+      if (!len) {
+        chart.data.labels = [];
+        chart.data.datasets = [];
+        metricBar.innerHTML = '';
+        renderChartStatus(data?.stats || {});
+        hideExternalTooltip();
+
+        renderInsightPanel(buildMarketSummary({
+          lastBid: null,
+          lastAsk: null,
+          lastMid: null,
+          dayVolumeTotal: 0,
+          bidPct: currentOrderBook.bidPct,
+          askPct: currentOrderBook.askPct,
+          bidTotal: currentOrderBook.bidTotal,
+          askTotal: currentOrderBook.askTotal
+        }));
+
+        chart.update();
+        return;
+      }
+
       const labels = [];
       const bidSeries = [];
       const askSeries = [];

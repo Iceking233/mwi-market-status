@@ -1,13 +1,11 @@
 // ==UserScript==
-// @name         SUPER mooket
-// @namespace    local.mooket.ultra.test
-// @version      20260327
-// @description  银河奶牛历史价格
+// @name         MWI mooket ultra
+// @namespace    https://github.com/Iceking233/mwi-market-status
+// @version      2026.3.27.1
+// @description  银河奶牛市场历史成交量、价格、订单簿显示、收藏夹实时记录涨跌。
 // @author       Iceking233
-// @thanks       1. 感谢mooket作者IOMisaka，本插件在mooket的基础上开发，提供了更多功能和更好的用户体验！
-// @thanks       2. 感谢mooket 2作者Q7，提供历史数据成交量接口！
-// @thanks       3. 感谢MWI Api作者holychikenz，提供了历史数据库！
-// @thanks       4. 感谢Joey、Baozhi、ColaCola、Hyh_fish的测试和大力支持！
+// @homepageURL  https://github.com/Iceking233/mwi-market-status
+// @supportURL   https://github.com/Iceking233/mwi-market-status/issues
 // @match        https://www.milkywayidle.com/*
 // @match        https://www.milkywayidlecn.com/*
 // @icon         https://www.milkywayidle.com/favicon.svg
@@ -19,6 +17,12 @@
 // @run-at       document-start
 // @license      MIT
 // ==/UserScript==
+/*
+1. 感谢mooket作者IOMisaka，本插件在mooket的基础上开发，提供了更多功能和更好的用户体验！
+2. 感谢历史上提供过市场数据支持的项目与作者。
+3. 感谢MWI Api作者holychikenz，提供了历史数据库！
+4. 感谢Joey、Baozhi、ColaCola、Hyh_fish的测试和大力支持！
+*/
 
 (function () {
   'use strict';
@@ -2350,15 +2354,21 @@
   }
   /*实时市场模块*/
   const HOST = "https://mooket.qi-e.top";
-  const MWIAPI_URL = `${HOST}/market/api.json`;
-  const THIRD_PARTY_HISTORY_URL = "https://q7.nainai.eu.org/api/market/history";
+  const MWIAPI_URL = "https://iceking233.github.io/mwi-market-status/market/api.json";
+  const OFFICIAL_HISTORY_MANIFEST_URL = "https://iceking233.github.io/mwi-market-status/market/history/official/manifest.json";
   const SQLITE_HISTORY_MANIFEST_URL = "https://iceking233.github.io/mwi-market-status/history/sqlite/manifest.json";
+  const FALLBACK_MARKET_API_URL = `${HOST}/market/api.json`;
+  const LEGACY_HISTORY_URL = `${HOST}/market/item/history`;
   const HISTORY_DB_NAME = "MWIHistoryDB";
   const HISTORY_DB_VERSION = 1;
-  const THIRD_PARTY_MAX_DAYS = 18;
-  const FULL_PRELOAD_DAYS = THIRD_PARTY_MAX_DAYS;
+  const OFFICIAL_HISTORY_MANIFEST_TTL = 30 * 60 * 1000;
   const SQLITE_HISTORY_MANIFEST_TTL = 6 * 3600 * 1000;
   const SQLITE_HISTORY_IMPORT_MIN_DAYS = 20;
+  const officialHistoryManifestState = {
+    value: null,
+    fetchedAt: 0,
+    inflight: null
+  };
   const sqliteHistoryManifestState = {
     value: null,
     fetchedAt: 0,
@@ -2367,6 +2377,25 @@
   const historyDebugState = {
     lastChartSignature: null
   };
+  const sourceNoticeState = {
+    market: null,
+    history: null
+  };
+
+  function setSourceNotice(type, detail = null) {
+    sourceNoticeState[type] = detail;
+  }
+
+  function formatSourceNoticeText(detail) {
+    if (!detail) return "";
+    const baseMessage = mwi.isZh
+      ? "数据来源由于网络原因无法访问"
+      : "Market data source is not reachable due to network restrictions";
+    const suffix = detail.fallback
+      ? (mwi.isZh ? `，当前已降级到${detail.fallback}` : `, currently using ${detail.fallback}`)
+      : (mwi.isZh ? "，当前只能使用本地缓存" : ", currently using local cache only");
+    return `${baseMessage}${suffix}`;
+  }
 
   class MarketHistoryStore {
     dbPromise = null;
@@ -2470,7 +2499,7 @@
       await this.setMeta("officialLastImportedAt", Math.floor(Date.now() / 1000));
       return records.length;
     }
-    async saveHistorySeries(itemHrid, variant, rows, source = "third_party_history", options = {}) {
+    async saveHistorySeries(itemHrid, variant, rows, source = "history_import", options = {}) {
       if (!itemHrid || !Array.isArray(rows) || rows.length === 0) return 0;
       const db = await this.init();
       if (!db) return 0;
@@ -2560,7 +2589,7 @@
           );
           resolve({
             cachedDays: countContinuousDays(rows),
-            cachedVolumeDays: Math.min(THIRD_PARTY_MAX_DAYS, countContinuousDays(historicalVolumeRows)),
+            cachedVolumeDays: countContinuousDays(historicalVolumeRows),
             totalPoints: rows.length,
             earliestTime: rows[0]?.time ?? null,
             latestTime: rows[rows.length - 1]?.time ?? null,
@@ -2623,6 +2652,34 @@
   }
   const marketHistoryStore = new MarketHistoryStore();
 
+  async function fetchOfficialHistoryManifest(signal) {
+    if (
+      officialHistoryManifestState.value &&
+      Date.now() - officialHistoryManifestState.fetchedAt < OFFICIAL_HISTORY_MANIFEST_TTL
+    ) {
+      return officialHistoryManifestState.value;
+    }
+    if (officialHistoryManifestState.inflight) {
+      return officialHistoryManifestState.inflight;
+    }
+
+    officialHistoryManifestState.inflight = fetch(OFFICIAL_HISTORY_MANIFEST_URL, { signal })
+      .then(response => {
+        if (!response.ok) throw new Error(`Official history manifest HTTP ${response.status}`);
+        return response.json();
+      })
+      .then(payload => {
+        officialHistoryManifestState.value = payload;
+        officialHistoryManifestState.fetchedAt = Date.now();
+        return payload;
+      })
+      .finally(() => {
+        officialHistoryManifestState.inflight = null;
+      });
+
+    return officialHistoryManifestState.inflight;
+  }
+
   function toAbsoluteUrl(pathOrUrl, baseUrl = SQLITE_HISTORY_MANIFEST_URL) {
     try {
       return new URL(pathOrUrl, baseUrl).toString();
@@ -2679,6 +2736,33 @@
 
     for (const key of lookupKeys) {
       if (manifest.items[key]) return manifest.items[key];
+    }
+    return null;
+  }
+
+  function resolveOfficialHistoryManifestEntry(manifest, itemHridName, variant = 0) {
+    if (!manifest?.items || !itemHridName) return null;
+
+    const normalizedKey = mwi.ensureItemHrid(itemHridName) || itemHridName;
+    const englishName = normalizedKey?.startsWith("/items/")
+      ? mwi.lang?.en?.translation?.itemNames?.[normalizedKey]
+      : null;
+    const chineseName = normalizedKey?.startsWith("/items/")
+      ? mwi.lang?.zh?.translation?.itemNames?.[normalizedKey]
+      : null;
+
+    const lookupKeys = [
+      normalizedKey,
+      itemHridName,
+      englishName,
+      chineseName
+    ].filter(Boolean);
+
+    for (const key of lookupKeys) {
+      const itemEntry = manifest.items[key];
+      if (!itemEntry?.variants) continue;
+      const variantEntry = itemEntry.variants[String(Number(variant) || 0)];
+      if (variantEntry?.path) return variantEntry;
     }
     return null;
   }
@@ -2755,6 +2839,48 @@
   async function runStartupHealthChecks() {
     const sampleItemHrid = "/items/apple";
     const sampleItemName = mwi.lang?.en?.translation?.itemNames?.[sampleItemHrid] || "Apple";
+    const officialManifest = await probeJsonEndpoint(
+      "official_history_manifest",
+      OFFICIAL_HISTORY_MANIFEST_URL,
+      payload => {
+        const itemCount = Object.keys(payload?.items || {}).length;
+        if (!itemCount) throw new Error("manifest items empty");
+        return `items=${itemCount}`;
+      }
+    );
+
+    let officialShard = {
+      label: "official_history_shard",
+      ok: false,
+      url: "",
+      ms: 0,
+      detail: "manifest unavailable"
+    };
+    if (officialManifest.ok) {
+      try {
+        const manifest = await fetchOfficialHistoryManifest();
+        const entry = resolveOfficialHistoryManifestEntry(manifest, sampleItemHrid, 0) ||
+          resolveOfficialHistoryManifestEntry(manifest, sampleItemName, 0) ||
+          Object.values(manifest?.items || {})[0]?.variants?.["0"];
+        if (entry?.path) {
+          const shardUrl = toAbsoluteUrl(entry.path, OFFICIAL_HISTORY_MANIFEST_URL);
+          officialShard = await probeJsonEndpoint(
+            "official_history_shard",
+            shardUrl,
+            payload => {
+              const rows = normalizeSqliteHistoryRows(payload?.rows || payload);
+              if (!rows.length) throw new Error("rows empty");
+              return `rows=${rows.length}`;
+            }
+          );
+        } else {
+          officialShard.detail = "manifest entry missing";
+        }
+      } catch (error) {
+        officialShard.detail = error?.message || String(error);
+      }
+    }
+
     const sqliteManifest = await probeJsonEndpoint(
       "sqlite_manifest",
       SQLITE_HISTORY_MANIFEST_URL,
@@ -2798,6 +2924,8 @@
     }
 
     const checks = await Promise.all([
+      Promise.resolve(officialManifest),
+      Promise.resolve(officialShard),
       Promise.resolve(sqliteManifest),
       Promise.resolve(sqliteShard),
       probeJsonEndpoint(
@@ -2810,24 +2938,24 @@
         }
       ),
       probeJsonEndpoint(
-        "third_party_history",
-        `${THIRD_PARTY_HISTORY_URL}?item_id=${encodeURIComponent(sampleItemHrid)}&variant=0&days=1`,
+        "fallback_market_api",
+        FALLBACK_MARKET_API_URL,
         payload => {
-          const rows = Array.isArray(payload) ? payload : payload?.data || payload?.rows || [];
-          if (!Array.isArray(rows)) throw new Error("payload invalid");
-          return `rows=${rows.length}`;
+          const itemCount = Object.keys(payload?.marketData || {}).length;
+          if (!payload?.timestamp || !itemCount) throw new Error("marketData empty");
+          return `items=${itemCount}`;
         }
       ),
       probeJsonEndpoint(
         "legacy_history",
-        `${HOST}/market/item/history?name=${encodeURIComponent(sampleItemHrid)}&level=0&time=86400`,
+        `${LEGACY_HISTORY_URL}?name=${encodeURIComponent(sampleItemHrid)}&level=0&time=86400`,
         payload => {
           const bidRows = payload?.bid || payload?.bids || [];
           const askRows = payload?.ask || payload?.asks || [];
           if (!Array.isArray(bidRows) || !Array.isArray(askRows)) throw new Error("payload invalid");
           return `bid=${bidRows.length},ask=${askRows.length}`;
         }
-      )
+      ),
     ]);
 
     const summary = checks.reduce((accumulator, check) => {
@@ -2899,17 +3027,47 @@
       });
       setInterval(() => { this.save(); }, 1000 * 600);//十分钟保存一次
     }
-    refreshOfficialMarketData(force = false) {
+    async refreshOfficialMarketData(force = false) {
       let cached = JSON.parse(localStorage.getItem("MWIAPI_JSON_NEW") || "null");
       if (!force && cached?.timestamp && Date.now() / 1000 - cached.timestamp < 3300) return;
-      fetch(MWIAPI_URL).then(res => {
-        res.text().then(mwiapiJsonStr => {
+      const sources = [
+        {
+          label: "github_pages",
+          url: MWIAPI_URL,
+          fallbackLabel: mwi.isZh ? "GitHub Pages 镜像" : "GitHub Pages mirror"
+        },
+        {
+          label: "legacy_market_api",
+          url: FALLBACK_MARKET_API_URL,
+          fallbackLabel: mwi.isZh ? "旧市场接口" : "legacy market API"
+        }
+      ];
+
+      let lastError = null;
+      for (const source of sources) {
+        try {
+          const response = await fetch(source.url, { cache: "no-store" });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const mwiapiJsonStr = await response.text();
           const mwiapiObj = JSON.parse(mwiapiJsonStr);
           this.mergeMWIData(mwiapiObj);
           localStorage.setItem("MWIAPI_JSON_NEW", mwiapiJsonStr);
-          console.info("MWIAPI_JSON updated:", new Date(mwiapiObj.timestamp * 1000).toLocaleString());
-        });
-      }).catch(err => { console.warn("MWIAPI_JSON update failed,using localdata"); });
+          setSourceNotice("market", source.label === "github_pages" ? null : { fallback: source.fallbackLabel });
+          renderChartStatus({});
+          console.info("MWIAPI_JSON updated:", source.label, new Date(mwiapiObj.timestamp * 1000).toLocaleString());
+          return;
+        } catch (err) {
+          lastError = err;
+        }
+      }
+
+      setSourceNotice("market", {
+        fallback: cached?.timestamp
+          ? (mwi.isZh ? "本地缓存" : "local cache")
+          : null
+      });
+      renderChartStatus({});
+      console.warn("MWIAPI_JSON update failed, using cached/local data", lastError);
     }
     handleMessageMarketItemOrderBooksUpdated(obj, upload = false) {
       //更新本地,游戏数据不带时间戳，市场服务器数据带时间戳
@@ -3502,6 +3660,19 @@
     chartStatusBar.style.fontSize = '11px';
     chartStatusBar.style.lineHeight = '1.35';
     chartWrap.appendChild(chartStatusBar);
+
+    const sourceNoticeBar = document.createElement('div');
+    sourceNoticeBar.id = 'mooket_source_notice';
+    sourceNoticeBar.style.display = 'none';
+    sourceNoticeBar.style.margin = '0 0 8px 0';
+    sourceNoticeBar.style.padding = '8px 10px';
+    sourceNoticeBar.style.borderRadius = '10px';
+    sourceNoticeBar.style.border = '1px solid rgba(255,196,0,0.28)';
+    sourceNoticeBar.style.background = 'rgba(255,196,0,0.08)';
+    sourceNoticeBar.style.color = '#ffd76a';
+    sourceNoticeBar.style.fontSize = '11px';
+    sourceNoticeBar.style.lineHeight = '1.45';
+    chartWrap.appendChild(sourceNoticeBar);
 
     const ctx = document.createElement('canvas');
     ctx.style.display = 'block';
@@ -4369,54 +4540,49 @@
       }
     });
 
-    const thirdPartyHistoryInflight = new Map();
+    const officialHistoryInflight = new Map();
     const sqliteHistoryInflight = new Map();
-    const preloadState = {
-      running: false,
-      total: 0,
-      done: 0,
-      displayTotal: 0,
-      displayDone: 0,
-      failed: 0,
-      currentKey: null
-    };
 
-    async function fetchThirdPartyHistory(itemHridName, level = 0, day = 1, signal) {
-      const cacheKey = `${itemHridName}:${Number(level) || 0}:${Number(day) || 1}`;
-      if (thirdPartyHistoryInflight.has(cacheKey)) {
-        return thirdPartyHistoryInflight.get(cacheKey);
+    async function fetchOfficialHistory(itemHridName, level = 0, day = 1, signal) {
+      const manifest = await fetchOfficialHistoryManifest(signal);
+      const entry = resolveOfficialHistoryManifestEntry(manifest, itemHridName, level);
+      if (!entry?.path) return [];
+
+      const cacheKey = `${itemHridName}:${Number(level) || 0}:${entry.path}`;
+      if (officialHistoryInflight.has(cacheKey)) {
+        return officialHistoryInflight.get(cacheKey);
       }
 
       const requestPromise = (async () => {
-      const params = new URLSearchParams();
-      params.append("item_id", itemHridName);
-      params.append("variant", String(Number(level) || 0));
-      params.append("days", String(Number(day) || 1));
+        const response = await fetch(toAbsoluteUrl(entry.path, OFFICIAL_HISTORY_MANIFEST_URL), { signal });
+        if (!response.ok) {
+          throw new Error(`Official history shard HTTP ${response.status}`);
+        }
 
-      const response = await fetch(`${THIRD_PARTY_HISTORY_URL}?${params}`, { signal });
-      if (!response.ok) {
-        throw new Error(`Third party history HTTP ${response.status}`);
-      }
+        const payload = await response.json();
+        const rows = normalizeSqliteHistoryRows(payload?.rows || payload);
+        if (!rows.length) return [];
 
-      const payload = await response.json();
-      const rows = Array.isArray(payload) ? payload : payload?.data || payload?.rows || [];
-      if (!Array.isArray(rows)) {
-        throw new Error("Third party history payload is not an array");
-      }
-
-      await marketHistoryStore.saveHistorySeries(itemHridName, level, rows, "third_party_history", { days: day });
-      logHistoryDebug("third_party_history imported", {
-        itemHrid: itemHridName,
-        level: Number(level) || 0,
-        day: Number(day) || 1,
-        rows: rows.length
-      });
-      return rows;
+        await marketHistoryStore.saveHistorySeries(
+          itemHridName,
+          level,
+          rows,
+          "official_archive",
+          { days: Number(entry.maxDays || day) || day }
+        );
+        logHistoryDebug("official_history imported", {
+          itemHrid: itemHridName,
+          level: Number(level) || 0,
+          day: Number(day) || 1,
+          rows: rows.length,
+          shard: entry.path
+        });
+        return rows;
       })();
 
-      thirdPartyHistoryInflight.set(cacheKey, requestPromise);
+      officialHistoryInflight.set(cacheKey, requestPromise);
       return requestPromise.finally(() => {
-        thirdPartyHistoryInflight.delete(cacheKey);
+        officialHistoryInflight.delete(cacheKey);
       });
     }
 
@@ -4465,91 +4631,6 @@
       });
     }
 
-    function buildFullPreloadQueue() {
-      const snapshot = JSON.parse(localStorage.getItem("MWIAPI_JSON_NEW") || "null");
-      const marketData = snapshot?.marketData || {};
-      const queue = [];
-      Object.entries(marketData).forEach(([itemHrid, variants]) => {
-        if (!itemHrid?.startsWith("/items/")) return;
-        Object.keys(variants || {}).forEach(variant => {
-          queue.push({ itemHrid, variant: Number(variant) || 0 });
-        });
-      });
-      queue.sort((a, b) => {
-        if (a.itemHrid === b.itemHrid) return a.variant - b.variant;
-        return a.itemHrid.localeCompare(b.itemHrid);
-      });
-      return queue;
-    }
-
-    function countUniqueItemsInQueue(queue) {
-      return new Set((queue || []).map(entry => entry.itemHrid).filter(Boolean)).size;
-    }
-
-    async function startFullHistoryWarmup() {
-      if (preloadState.running) return;
-      const warmupMeta = await marketHistoryStore.getMeta("fullHistoryWarmup");
-      if (warmupMeta?.completed) return;
-
-      const queue = buildFullPreloadQueue();
-      if (!queue.length) return;
-
-      preloadState.running = true;
-      preloadState.total = queue.length;
-      preloadState.done = 0;
-      preloadState.displayTotal = countUniqueItemsInQueue(queue);
-      preloadState.displayDone = 0;
-      preloadState.failed = 0;
-      preloadState.currentKey = null;
-      const completedItems = new Set();
-
-      for (const entry of queue) {
-        const pairKey = `history:third_party_history:${entry.itemHrid}:${entry.variant}`;
-        const pairMeta = await marketHistoryStore.getMeta(pairKey);
-        if (Number(pairMeta?.days || 0) >= FULL_PRELOAD_DAYS) {
-          preloadState.done += 1;
-          completedItems.add(entry.itemHrid);
-          preloadState.displayDone = completedItems.size;
-          continue;
-        }
-
-        preloadState.currentKey = `${entry.itemHrid}:${entry.variant}`;
-        try {
-          await fetchThirdPartyHistory(entry.itemHrid, entry.variant, FULL_PRELOAD_DAYS);
-        } catch (error) {
-          preloadState.failed += 1;
-          console.warn("fullHistoryWarmup item failed", preloadState.currentKey, error);
-        }
-        preloadState.done += 1;
-        completedItems.add(entry.itemHrid);
-        preloadState.displayDone = completedItems.size;
-        await marketHistoryStore.setMeta("fullHistoryWarmup", {
-          completed: false,
-          updatedAt: Math.floor(Date.now() / 1000),
-          total: preloadState.total,
-          done: preloadState.done,
-          displayTotal: preloadState.displayTotal,
-          displayDone: preloadState.displayDone,
-          failed: preloadState.failed,
-          currentKey: preloadState.currentKey
-        });
-        await new Promise(resolve => setTimeout(resolve, 120));
-      }
-
-      preloadState.running = false;
-      preloadState.currentKey = null;
-      await marketHistoryStore.setMeta("fullHistoryWarmup", {
-        completed: true,
-        completedAt: Math.floor(Date.now() / 1000),
-        total: preloadState.total,
-        done: preloadState.done,
-        displayTotal: preloadState.displayTotal,
-        displayDone: preloadState.displayDone,
-        failed: preloadState.failed
-      });
-      console.info("fullHistoryWarmup completed", preloadState.done, preloadState.failed);
-    }
-
     function requestItemPrice(itemHridName, day = 1, level = 0) {
       if (!itemHridName) return;
       if (curHridName === itemHridName && curLevel == level && curDay == day) return;//防止重复请求
@@ -4589,13 +4670,14 @@
           }
 
           if (marketHistoryStore.hasCoverage(rows, day)) {
+            setSourceNotice("history", null);
             const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
             updateChart(marketHistoryStore.toChartData(rows, stats, day), curDay);
             return true;
           }
 
           try {
-            const importedRows = await fetchThirdPartyHistory(curHridName, curLevel, day, historyAbortController.signal);
+            const importedRows = await fetchOfficialHistory(curHridName, curLevel, day, historyAbortController.signal);
             if (
               requestToken !== historyRequestToken ||
               curHridName !== itemHridName ||
@@ -4606,16 +4688,15 @@
             }
 
             if (importedRows.length > 0) {
+              setSourceNotice("history", null);
               const mergedRows = await marketHistoryStore.queryHistory(curHridName, curLevel, day);
               const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
-              if (marketHistoryStore.hasCoverage(mergedRows, day)) {
-                updateChart(marketHistoryStore.toChartData(mergedRows, stats, day), curDay);
-                return true;
-              }
+              updateChart(marketHistoryStore.toChartData(mergedRows, stats, day), curDay);
+              if (marketHistoryStore.hasCoverage(mergedRows, day)) return true;
             }
           } catch (err) {
             if (err?.name === 'AbortError') return true;
-            console.warn("第三方历史接口读取失败，回退旧接口", err);
+            console.warn("官方历史分片读取失败，尝试其他本地来源", err);
           }
 
           if (Number(curLevel) === 0 && Number(day) >= SQLITE_HISTORY_IMPORT_MIN_DAYS) {
@@ -4631,64 +4712,68 @@
               }
 
               if (importedRows.length > 0) {
-                const mergedRows = await marketHistoryStore.queryHistory(curHridName, curLevel, day);
-                const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
-                if (marketHistoryStore.hasCoverage(mergedRows, day)) {
-                  updateChart(marketHistoryStore.toChartData(mergedRows, stats, day), curDay);
-                  return true;
-                }
-              }
-            } catch (err) {
-              if (err?.name === 'AbortError') return true;
-              console.warn("SQLite 历史分片读取失败，回退旧接口", err);
-            }
-          }
-
-          return fetch(`${HOST}/market/item/history?${params}`, { signal: historyAbortController.signal })
-            .then(res => res.json())
-            .then(async data => {
-              if (
-                requestToken !== historyRequestToken ||
-                curHridName !== itemHridName ||
-                Number(curLevel) !== Number(level) ||
-                Number(curDay) !== Number(day)
-              ) {
-                return;
-              }
-              const fallbackRows = [];
-              const bidRows = data?.bid || data?.bids || [];
-              const askRows = data?.ask || data?.asks || [];
-              const fallbackLength = Math.min(bidRows.length, askRows.length);
-              for (let i = 0; i < fallbackLength; i++) {
-                const bidRow = bidRows[i] || {};
-                const askRow = askRows[i] || {};
-                fallbackRows.push({
-                  time: askRow.time ?? bidRow.time,
-                  a: askRow.price ?? askRow.ask ?? -1,
-                  b: bidRow.price ?? bidRow.bid ?? -1,
-                  p: askRow.avg ?? bidRow.avg ?? 0,
-                  v: askRow.volume ?? bidRow.volume ?? askRow.v ?? bidRow.v ?? 0
-                });
-              }
-              if (fallbackRows.length > 0) {
-                await marketHistoryStore.saveHistorySeries(curHridName, curLevel, fallbackRows, "legacy_history", { days: day });
-                logHistoryDebug("legacy_history imported", {
-                  itemHrid: curHridName,
-                  level: Number(curLevel) || 0,
-                  day: Number(day) || 1,
-                  rows: fallbackRows.length
-                });
+                setSourceNotice("history", null);
                 const mergedRows = await marketHistoryStore.queryHistory(curHridName, curLevel, day);
                 const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
                 updateChart(marketHistoryStore.toChartData(mergedRows, stats, day), curDay);
-                return;
+                if (marketHistoryStore.hasCoverage(mergedRows, day)) return true;
               }
-              updateChart(data, curDay);
-            })
-            .catch(err => {
-              if (err?.name === 'AbortError') return;
-              console.error("请求历史价格失败", err);
-            });
+            } catch (err) {
+              if (err?.name === 'AbortError') return true;
+              console.warn("SQLite 历史分片读取失败，保留本地快照", err);
+            }
+          }
+
+          try {
+            const response = await fetch(`${LEGACY_HISTORY_URL}?${params}`, { signal: historyAbortController.signal });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const data = await response.json();
+            if (
+              requestToken !== historyRequestToken ||
+              curHridName !== itemHridName ||
+              Number(curLevel) !== Number(level) ||
+              Number(curDay) !== Number(day)
+            ) {
+              return true;
+            }
+            const fallbackRows = [];
+            const bidRows = data?.bid || data?.bids || [];
+            const askRows = data?.ask || data?.asks || [];
+            const fallbackLength = Math.min(bidRows.length, askRows.length);
+            for (let i = 0; i < fallbackLength; i++) {
+              const bidRow = bidRows[i] || {};
+              const askRow = askRows[i] || {};
+              fallbackRows.push({
+                time: askRow.time ?? bidRow.time,
+                a: askRow.price ?? askRow.ask ?? -1,
+                b: bidRow.price ?? bidRow.bid ?? -1,
+                p: askRow.avg ?? bidRow.avg ?? 0,
+                v: askRow.volume ?? bidRow.volume ?? askRow.v ?? bidRow.v ?? 0
+              });
+            }
+            if (fallbackRows.length > 0) {
+              await marketHistoryStore.saveHistorySeries(curHridName, curLevel, fallbackRows, "legacy_history", { days: day });
+              setSourceNotice("history", {
+                fallback: mwi.isZh ? "旧历史接口" : "legacy history API"
+              });
+              const mergedRows = await marketHistoryStore.queryHistory(curHridName, curLevel, day);
+              const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
+              updateChart(marketHistoryStore.toChartData(mergedRows, stats, day), curDay);
+              return true;
+            }
+          } catch (err) {
+            if (err?.name === 'AbortError') return true;
+            console.warn("旧历史接口读取失败，保留本地历史", err);
+          }
+
+          setSourceNotice("history", {
+            fallback: rows.length
+              ? (mwi.isZh ? "本地历史缓存" : "local history cache")
+              : null
+          });
+          const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
+          updateChart(marketHistoryStore.toChartData(rows, stats, day), curDay);
+          return true;
         })
         .catch(err => {
           console.error("读取本地历史失败", err);
@@ -4804,6 +4889,13 @@
       return `${date.getFullYear()}.${date.getMonth() + 1}.${date.getDate()} ${hours}:${minutes}`;
     }
 
+    function formatCompactNumber(value, suffix) {
+      const sign = value < 0 ? -1 : 1;
+      const compactAbs = Math.trunc(Math.abs(value) * 10) / 10;
+      const compact = compactAbs * sign;
+      return Number.isInteger(compact) ? `${compact}${suffix}` : `${compact.toFixed(1).replace(/\.0$/, '')}${suffix}`;
+    }
+
     function showNumber(num) {
       if (num === null || num === undefined || num === '') return '-';
       if (isNaN(num)) return num;
@@ -4813,19 +4905,16 @@
 
       if (abs === 0) return '0';
 
-      if (abs >= 1e9) {
-        const v = n / 1e9;
-        return Number.isInteger(v) ? `${v}B` : `${parseFloat(v.toFixed(1))}B`;
+      if (abs >= 1e10) {
+        return formatCompactNumber(n / 1e9, 'B');
       }
 
-      if (abs >= 1e6) {
-        const v = n / 1e6;
-        return Number.isInteger(v) ? `${v}M` : `${parseFloat(v.toFixed(1))}M`;
+      if (abs >= 1e7) {
+        return formatCompactNumber(n / 1e6, 'M');
       }
 
-      if (abs >= 1e3) {
-        const v = n / 1e3;
-        return Number.isInteger(v) ? `${v}K` : `${parseFloat(v.toFixed(1))}K`;
+      if (abs >= 1e4) {
+        return formatCompactNumber(n / 1e3, 'K');
       }
 
       if (abs < 1) return n.toFixed(2);
@@ -4858,8 +4947,18 @@
       };
     }
 
+    function renderSourceNotice() {
+      const notices = [sourceNoticeState.market, sourceNoticeState.history]
+        .filter(Boolean)
+        .map(formatSourceNoticeText)
+        .filter(Boolean);
+      sourceNoticeBar.innerHTML = notices.join('<br>');
+      sourceNoticeBar.style.display = notices.length ? 'block' : 'none';
+    }
+
     function renderChartStatus() {
       chartStatusBar.innerHTML = '';
+      renderSourceNotice();
     }
     
     //data={'bid':[{time:1,price:1}],'ask':[{time:1,price:1}]}
@@ -5191,9 +5290,6 @@
     //setInterval(updateInventoryStatus, 60000);
     toggleShow(config.visible);
     keepToggleButtonVisible();
-    startFullHistoryWarmup();
-    setInterval(() => { startFullHistoryWarmup(); }, 1000 * 600);
-
     updateOrderBook({
       itemHrid: null,
       level: 0,

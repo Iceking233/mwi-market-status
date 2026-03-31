@@ -61,7 +61,7 @@ If the official JSON source changes, you can configure it without editing code:
 
 If you do not set it, the workflow uses:
 
-- `https://mooket.qi-e.top/market/api.json`
+- `https://www.milkywayidle.com/game_data/marketplace.json`
 
 ## First run
 

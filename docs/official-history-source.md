@@ -10,7 +10,7 @@ node bakcend/sync-official-market-history.mjs
 
 By default the script:
 
-1. Downloads the latest market snapshot from `MWI_OFFICIAL_MARKET_URL` or `https://mooket.qi-e.top/market/api.json`.
+1. Downloads the latest market snapshot from `MWI_OFFICIAL_MARKET_URL` or `https://www.milkywayidle.com/game_data/marketplace.json`.
 2. Saves the raw snapshot to `docs/history/official/snapshots/YYYY/MM/DD/<timestamp>.json`.
 3. Updates `docs/history/official/latest.json`.
 4. Appends per-item/per-variant history shards under `docs/history/official/items/`.
@@ -21,7 +21,7 @@ By default the script:
 
 The workflow [`.github/workflows/sync-official-market-history.yml`](../.github/workflows/sync-official-market-history.yml) runs every 30 minutes and can also be triggered manually.
 
-If you set the repository variable `MWI_OFFICIAL_MARKET_URL`, the workflow will fetch from that URL. Otherwise it falls back to `https://mooket.qi-e.top/market/api.json`.
+If you set the repository variable `MWI_OFFICIAL_MARKET_URL`, the workflow will fetch from that URL. Otherwise it falls back to `https://www.milkywayidle.com/game_data/marketplace.json`.
 
 ## Published API shape
 

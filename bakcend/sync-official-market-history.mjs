@@ -5,9 +5,9 @@ import path from "node:path";
 
 function parseArgs(argv) {
   const args = {
-    sourceUrl: process.env.MWI_OFFICIAL_MARKET_URL || "https://mooket.qi-e.top/market/api.json",
+    sourceUrl: process.env.MWI_OFFICIAL_MARKET_URL || "https://www.milkywayidle.com/game_data/marketplace.json",
     outDir: path.resolve("docs/history/official"),
-    sourceName: "official_market_api"
+    sourceName: "official_marketplace_json"
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -58,11 +58,30 @@ async function readJsonIfExists(filePath, fallback) {
   }
 }
 
-function normalizeSnapshot(payload) {
-  const timestamp = Number(payload?.timestamp);
+function resolveSnapshotTimestamp(payload, response) {
+  const payloadTimestamp = Number(payload?.timestamp);
+  if (payloadTimestamp > 0) return payloadTimestamp;
+
+  const lastModified = response.headers.get("last-modified");
+  const lastModifiedMs = lastModified ? Date.parse(lastModified) : NaN;
+  if (Number.isFinite(lastModifiedMs) && lastModifiedMs > 0) {
+    return Math.floor(lastModifiedMs / 1000);
+  }
+
+  const responseDate = response.headers.get("date");
+  const responseDateMs = responseDate ? Date.parse(responseDate) : NaN;
+  if (Number.isFinite(responseDateMs) && responseDateMs > 0) {
+    return Math.floor(responseDateMs / 1000);
+  }
+
+  return Math.floor(Date.now() / 1000);
+}
+
+function normalizeSnapshot(payload, response, sourceUrl) {
+  const timestamp = resolveSnapshotTimestamp(payload, response);
   const marketData = payload?.marketData;
-  if (!timestamp || !marketData || typeof marketData !== "object") {
-    throw new Error("Snapshot payload missing timestamp or marketData");
+  if (!marketData || typeof marketData !== "object") {
+    throw new Error("Snapshot payload missing marketData");
   }
 
   const items = [];
@@ -88,9 +107,19 @@ function normalizeSnapshot(payload) {
     throw new Error("Snapshot marketData has no item rows");
   }
 
+  const normalizedPayload = {
+    timestamp,
+    marketData,
+    meta: {
+      sourceUrl,
+      lastModified: response.headers.get("last-modified") || null,
+      fetchedAt: new Date().toISOString()
+    }
+  };
+
   return {
     timestamp,
-    payload,
+    payload: normalizedPayload,
     items
   };
 }
@@ -133,7 +162,7 @@ async function main() {
   }
 
   const snapshotPayload = await response.json();
-  const snapshot = normalizeSnapshot(snapshotPayload);
+  const snapshot = normalizeSnapshot(snapshotPayload, response, args.sourceUrl);
   const manifest = await readJsonIfExists(manifestPath, createEmptyManifest(args.sourceName));
 
   const snapshotDate = new Date(snapshot.timestamp * 1000);

@@ -165,6 +165,8 @@ async function main() {
   const snapshot = normalizeSnapshot(snapshotPayload, response, args.sourceUrl);
   const manifest = await readJsonIfExists(manifestPath, createEmptyManifest(args.sourceName));
 
+  const isSameSnapshot = Number(manifest?.latestSnapshot?.timestamp || 0) === Number(snapshot.timestamp || 0);
+
   const snapshotDate = new Date(snapshot.timestamp * 1000);
   const year = String(snapshotDate.getUTCFullYear());
   const month = String(snapshotDate.getUTCMonth() + 1).padStart(2, "0");
@@ -176,6 +178,28 @@ async function main() {
   await fs.mkdir(archiveDir, { recursive: true });
   await fs.writeFile(archivePath, `${JSON.stringify(snapshot.payload)}\n`, "utf8");
   await fs.writeFile(latestPath, `${JSON.stringify(snapshot.payload)}\n`, "utf8");
+
+  if (isSameSnapshot) {
+    await fs.writeFile(publicApiPath, `${JSON.stringify(snapshot.payload)}\n`, "utf8");
+    await fs.writeFile(
+      publicManifestPath,
+      `${JSON.stringify({
+        version: 1,
+        generatedAt: manifest.generatedAt,
+        sourceName: manifest.sourceName,
+        latestSnapshot: manifest.latestSnapshot,
+        endpoints: {
+          latestMarketApi: "market/api.json",
+          officialHistoryManifest: "history/official/manifest.json",
+          sqliteHistoryManifest: "history/sqlite/manifest.json"
+        }
+      })}\n`,
+      "utf8"
+    );
+    await fs.writeFile(publicHistoryManifestPath, `${JSON.stringify(manifest)}\n`, "utf8");
+    console.log(`Snapshot ${snapshot.timestamp} already imported, skipped shard rewrite`);
+    return;
+  }
 
   let touchedVariants = 0;
   for (const entry of snapshot.items) {

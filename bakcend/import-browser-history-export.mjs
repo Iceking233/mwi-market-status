@@ -11,7 +11,9 @@ const ALLOWED_SOURCES = new Set([
   "sqlite_history",
   "mwiapi_market_db",
   "official_marketplace_json",
-  "official_market_api"
+  "official_market_api",
+  "legacy_history",
+  "third_party_history"
 ]);
 
 function parseArgs(argv) {
@@ -107,18 +109,11 @@ function scoreRowSource(source) {
   }
 }
 
-function sanitizeExistingRows(rows) {
-  return (rows || []).filter(row =>
-    Number(row?.time) > 0 &&
-    ALLOWED_SOURCES.has(row?.source ?? null)
-  );
-}
-
 function mergeRows(existingRows, importedRows) {
   const byTime = new Map();
-  for (const row of sanitizeExistingRows(existingRows)) {
+  for (const row of existingRows || []) {
     const time = Number(row?.time) || 0;
-    if (!time) continue;
+    if (!time || !ALLOWED_SOURCES.has(row?.source ?? null)) continue;
     byTime.set(time, row);
   }
   for (const row of importedRows || []) {

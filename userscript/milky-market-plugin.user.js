@@ -2359,7 +2359,7 @@
   const SQLITE_HISTORY_MANIFEST_URL = "https://iceking233.github.io/mwi-market-status/history/sqlite/manifest.json";
   const FALLBACK_MARKET_API_URL = `${HOST}/market/api.json`;
   const LEGACY_HISTORY_URL = `${HOST}/market/item/history`;
-  const Q7_HISTORY_URL = "https://q7.nainai.eu.org/api/market/history";
+  const Q7_HISTORY_URL = "https://q7.nainai.eu.org/api/market/histories";
   const HISTORY_DB_NAME = "MWIHistoryDB";
   const HISTORY_DB_VERSION = 1;
   const OFFICIAL_HISTORY_MANIFEST_TTL = 30 * 60 * 1000;
@@ -4801,8 +4801,9 @@
       });
     }
 
-    function normalizeQ7HistoryRows(payload) {
-      const rows = Array.isArray(payload) ? payload : payload?.data || payload?.rows || [];
+    function normalizeQ7HistoryRows(payload, itemHridName, level = 0) {
+      const variantKey = String(Number(level) || 0);
+      const rows = payload?.[itemHridName]?.[variantKey];
       if (!Array.isArray(rows)) return [];
       return rows
         .filter(row => Number(row?.time) > 0)
@@ -4824,7 +4825,7 @@
 
       const requestPromise = (async () => {
         const url = new URL(Q7_HISTORY_URL);
-        url.searchParams.set("item_id", itemHridName);
+        url.searchParams.append("item_id", itemHridName);
         url.searchParams.set("variant", String(Number(level) || 0));
         url.searchParams.set("days", String(Math.max(1, Number(day) || 1)));
         const response = await fetch(url, { signal, cache: "no-store" });
@@ -4832,7 +4833,7 @@
           throw new Error(`Q7 history HTTP ${response.status}`);
         }
         const payload = await response.json();
-        const rows = normalizeQ7HistoryRows(payload);
+        const rows = normalizeQ7HistoryRows(payload, itemHridName, level);
         if (!rows.length) return [];
 
         await marketHistoryStore.mergeHistorySeries(

@@ -2377,24 +2377,9 @@
   const historyDebugState = {
     lastChartSignature: null
   };
-  const sourceNoticeState = {
-    market: null,
-    history: null
-  };
-
   function setSourceNotice(type, detail = null) {
-    sourceNoticeState[type] = detail;
-  }
-
-  function formatSourceNoticeText(detail) {
-    if (!detail) return "";
-    const baseMessage = mwi.isZh
-      ? "首选数据源当前不可用"
-      : "Preferred data source is currently unavailable";
-    const suffix = detail.fallback
-      ? (mwi.isZh ? `，当前已降级到${detail.fallback}` : `, currently using ${detail.fallback}`)
-      : (mwi.isZh ? "，当前只能使用本地缓存" : ", currently using local cache only");
-    return `${baseMessage}${suffix}`;
+    void type;
+    void detail;
   }
 
   class MarketHistoryStore {
@@ -2926,40 +2911,44 @@
       }
     }
 
-    const checks = await Promise.all([
-      Promise.resolve(officialManifest),
-      Promise.resolve(officialShard),
-      Promise.resolve(sqliteManifest),
-      Promise.resolve(sqliteShard),
-      probeJsonEndpoint(
-        "official_market_api",
-        MWIAPI_URL,
-        payload => {
-          const itemCount = Object.keys(payload?.marketData || {}).length;
-          if (!payload?.timestamp || !itemCount) throw new Error("marketData empty");
-          return `items=${itemCount}`;
-        }
-      ),
-      probeJsonEndpoint(
-        "fallback_market_api",
-        FALLBACK_MARKET_API_URL,
-        payload => {
-          const itemCount = Object.keys(payload?.marketData || {}).length;
-          if (!payload?.timestamp || !itemCount) throw new Error("marketData empty");
-          return `items=${itemCount}`;
-        }
-      ),
-      probeJsonEndpoint(
-        "legacy_history",
-        `${LEGACY_HISTORY_URL}?name=${encodeURIComponent(sampleItemHrid)}&level=0&time=86400`,
-        payload => {
-          const bidRows = payload?.bid || payload?.bids || [];
-          const askRows = payload?.ask || payload?.asks || [];
-          if (!Array.isArray(bidRows) || !Array.isArray(askRows)) throw new Error("payload invalid");
-          return `bid=${bidRows.length},ask=${askRows.length}`;
-        }
-      ),
-    ]);
+    const githubMarketApi = await probeJsonEndpoint(
+      "github_market_api",
+      MWIAPI_URL,
+      payload => {
+        const itemCount = Object.keys(payload?.marketData || {}).length;
+        if (!payload?.timestamp || !itemCount) throw new Error("marketData empty");
+        return `items=${itemCount}`;
+      }
+    );
+    const fallbackMarketApi = await probeJsonEndpoint(
+      "fallback_market_api",
+      FALLBACK_MARKET_API_URL,
+      payload => {
+        const itemCount = Object.keys(payload?.marketData || {}).length;
+        if (!payload?.timestamp || !itemCount) throw new Error("marketData empty");
+        return `items=${itemCount}`;
+      }
+    );
+    const legacyHistory = await probeJsonEndpoint(
+      "legacy_history",
+      `${LEGACY_HISTORY_URL}?name=${encodeURIComponent(sampleItemHrid)}&level=0&time=86400`,
+      payload => {
+        const bidRows = payload?.bid || payload?.bids || [];
+        const askRows = payload?.ask || payload?.asks || [];
+        if (!Array.isArray(bidRows) || !Array.isArray(askRows)) throw new Error("payload invalid");
+        return `bid=${bidRows.length},ask=${askRows.length}`;
+      }
+    );
+
+    const checks = [
+      githubMarketApi,
+      officialManifest,
+      officialShard,
+      sqliteManifest,
+      sqliteShard,
+      fallbackMarketApi,
+      legacyHistory
+    ];
 
     const summary = checks.reduce((accumulator, check) => {
       accumulator[check.label] = {
@@ -3036,8 +3025,7 @@
       const sources = [
         {
           label: "github_pages",
-          url: MWIAPI_URL,
-          fallbackLabel: mwi.isZh ? "GitHub Pages 镜像" : "GitHub Pages mirror"
+          url: MWIAPI_URL
         },
         {
           label: "legacy_market_api",
@@ -3055,7 +3043,13 @@
           const mwiapiObj = JSON.parse(mwiapiJsonStr);
           this.mergeMWIData(mwiapiObj);
           localStorage.setItem("MWIAPI_JSON_NEW", mwiapiJsonStr);
-          setSourceNotice("market", source.label === "github_pages" ? null : { fallback: source.fallbackLabel });
+          setSourceNotice("market", source.label === "github_pages"
+            ? null
+            : {
+                message: mwi.isZh
+                  ? `无法访问github接口，请检查当前网络环境；当前已降级到${source.fallbackLabel}`
+                  : `GitHub interface is not reachable; please check current network access. Currently using ${source.fallbackLabel}`
+              });
           renderChartStatus({});
           console.info("MWIAPI_JSON updated:", source.label, new Date(mwiapiObj.timestamp * 1000).toLocaleString());
           return;
@@ -3065,9 +3059,13 @@
       }
 
       setSourceNotice("market", {
-        fallback: cached?.timestamp
-          ? (mwi.isZh ? "本地缓存" : "local cache")
-          : null
+        message: cached?.timestamp
+          ? (mwi.isZh
+              ? "无法访问github接口，请检查当前网络环境；当前只能使用本地缓存"
+              : "GitHub interface is not reachable; please check current network access. Currently using local cache only")
+          : (mwi.isZh
+              ? "无法访问github接口，请检查当前网络环境"
+              : "GitHub interface is not reachable; please check current network access")
       });
       renderChartStatus({});
       console.warn("MWIAPI_JSON update failed, using cached/local data", lastError);
@@ -3652,30 +3650,6 @@
     metricBar.style.fontSize = '12px';
     metricBar.style.justifyContent = 'flex-start';
     chartWrap.appendChild(metricBar);
-
-    const chartStatusBar = document.createElement('div');
-    chartStatusBar.id = 'mooket_chart_status';
-    chartStatusBar.style.display = 'none';
-    chartStatusBar.style.flexWrap = 'wrap';
-    chartStatusBar.style.gap = '8px 12px';
-    chartStatusBar.style.padding = '0 0 8px 0';
-    chartStatusBar.style.color = '#8fa0b3';
-    chartStatusBar.style.fontSize = '11px';
-    chartStatusBar.style.lineHeight = '1.35';
-    chartWrap.appendChild(chartStatusBar);
-
-    const sourceNoticeBar = document.createElement('div');
-    sourceNoticeBar.id = 'mooket_source_notice';
-    sourceNoticeBar.style.display = 'none';
-    sourceNoticeBar.style.margin = '0 0 8px 0';
-    sourceNoticeBar.style.padding = '8px 10px';
-    sourceNoticeBar.style.borderRadius = '10px';
-    sourceNoticeBar.style.border = '1px solid rgba(255,196,0,0.28)';
-    sourceNoticeBar.style.background = 'rgba(255,196,0,0.08)';
-    sourceNoticeBar.style.color = '#ffd76a';
-    sourceNoticeBar.style.fontSize = '11px';
-    sourceNoticeBar.style.lineHeight = '1.45';
-    chartWrap.appendChild(sourceNoticeBar);
 
     const ctx = document.createElement('canvas');
     ctx.style.display = 'block';
@@ -4715,6 +4689,26 @@
       });
     }
 
+    function hasUsableHistoricalVolume(stats, day) {
+      const requestedDays = Number(day) || 1;
+      const labels = Array.isArray(stats?.sourceLabels) ? stats.sourceLabels : [];
+      const historicalVolumeSources = new Set([
+        "official_archive",
+        "legacy_history",
+        "third_party_history"
+      ]);
+
+      if (labels.some(label => historicalVolumeSources.has(label))) {
+        return true;
+      }
+
+      if (requestedDays <= 1) {
+        return Number(stats?.cachedVolumeDays || 0) >= 1;
+      }
+
+      return Number(stats?.cachedVolumeDays || 0) >= Math.min(requestedDays, 3);
+    }
+
     function requestItemPrice(itemHridName, day = 1, level = 0) {
       if (!itemHridName) return;
       if (curHridName === itemHridName && curLevel == level && curDay == day) return;//防止重复请求
@@ -4753,9 +4747,12 @@
             return true;
           }
 
-          if (marketHistoryStore.hasCoverage(rows, day)) {
+          const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
+          const hasPriceCoverage = marketHistoryStore.hasCoverage(rows, day);
+          const hasVolumeCoverage = hasUsableHistoricalVolume(stats, day);
+
+          if (hasPriceCoverage && hasVolumeCoverage) {
             setSourceNotice("history", null);
-            const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
             updateChart(marketHistoryStore.toChartData(rows, stats, day), curDay);
             return true;
           }
@@ -4774,12 +4771,17 @@
             if (importedRows.length > 0) {
               setSourceNotice("history", null);
               const mergedRows = await marketHistoryStore.queryHistory(curHridName, curLevel, day);
-              const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
-              updateChart(marketHistoryStore.toChartData(mergedRows, stats, day), curDay);
-              if (marketHistoryStore.hasCoverage(mergedRows, day)) return true;
+              const mergedStats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
+              updateChart(marketHistoryStore.toChartData(mergedRows, mergedStats, day), curDay);
+              if (marketHistoryStore.hasCoverage(mergedRows, day) && hasUsableHistoricalVolume(mergedStats, day)) return true;
             }
           } catch (err) {
             if (err?.name === 'AbortError') return true;
+            setSourceNotice("history", {
+              message: mwi.isZh
+                ? "无法访问github接口，请检查当前网络环境"
+                : "GitHub interface is not reachable; please check current network access"
+            });
             console.warn("官方历史分片读取失败，尝试其他本地来源", err);
           }
 
@@ -4796,11 +4798,15 @@
               }
 
               if (importedRows.length > 0) {
-                setSourceNotice("history", null);
+                setSourceNotice("history", {
+                  message: mwi.isZh
+                    ? "无法访问github接口，请检查当前网络环境；当前已降级到SQLite历史分片"
+                    : "GitHub interface is not reachable; please check current network access. Currently using SQLite history shards"
+                });
                 const mergedRows = await marketHistoryStore.queryHistory(curHridName, curLevel, day);
-                const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
-                updateChart(marketHistoryStore.toChartData(mergedRows, stats, day), curDay);
-                if (marketHistoryStore.hasCoverage(mergedRows, day)) return true;
+                const mergedStats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
+                updateChart(marketHistoryStore.toChartData(mergedRows, mergedStats, day), curDay);
+                if (marketHistoryStore.hasCoverage(mergedRows, day) && hasUsableHistoricalVolume(mergedStats, day)) return true;
               }
             } catch (err) {
               if (err?.name === 'AbortError') return true;
@@ -4837,10 +4843,14 @@
             }
             if (fallbackRows.length > 0) {
               await marketHistoryStore.saveHistorySeries(curHridName, curLevel, fallbackRows, "legacy_history", { days: day });
-              setSourceNotice("history", null);
+              setSourceNotice("history", {
+                message: mwi.isZh
+                  ? "无法访问github接口，请检查当前网络环境；当前已降级到旧历史接口"
+                  : "GitHub interface is not reachable; please check current network access. Currently using legacy history API"
+              });
               const mergedRows = await marketHistoryStore.queryHistory(curHridName, curLevel, day);
-              const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
-              updateChart(marketHistoryStore.toChartData(mergedRows, stats, day), curDay);
+              const mergedStats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
+              updateChart(marketHistoryStore.toChartData(mergedRows, mergedStats, day), curDay);
               return true;
             }
           } catch (err) {
@@ -4853,7 +4863,6 @@
               ? (mwi.isZh ? "本地历史缓存" : "local history cache")
               : null
           });
-          const stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
           updateChart(marketHistoryStore.toChartData(rows, stats, day), curDay);
           return true;
         })
@@ -5029,18 +5038,8 @@
       };
     }
 
-    function renderSourceNotice() {
-      const notices = [sourceNoticeState.market, sourceNoticeState.history]
-        .filter(Boolean)
-        .map(formatSourceNoticeText)
-        .filter(Boolean);
-      sourceNoticeBar.innerHTML = notices.join('<br>');
-      sourceNoticeBar.style.display = notices.length ? 'block' : 'none';
-    }
-
     function renderChartStatus() {
-      chartStatusBar.innerHTML = '';
-      renderSourceNotice();
+      return;
     }
     
     //data={'bid':[{time:1,price:1}],'ask':[{time:1,price:1}]}

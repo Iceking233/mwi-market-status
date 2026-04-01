@@ -1,1 +1,1 @@
-{"version":1,"source":"official_marketplace_json","itemHrid":"/items/magicians_hat","variant":9,"earliestTime":1775077980,"latestTime":1775077980,"rows":[{"time":1775077980,"a":225000000,"b":-1,"p":null,"v":null}]}
+{"version":1,"source":"official_marketplace_json","itemHrid":"/items/magicians_hat","variant":9,"earliestTime":1775077980,"latestTime":1775080996,"rows":[{"time":1775077980,"a":225000000,"b":-1,"p":null,"v":null},{"time":1775080996,"a":-1,"b":-1,"p":225000000,"v":1}]}

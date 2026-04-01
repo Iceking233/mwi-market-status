@@ -1,8 +1,10 @@
 // ==UserScript==
-// @name         MWI mooket ultra
+// @name         MWI Market Status
+// @name:zh-CN   MWI 市场状态增强
 // @namespace    https://github.com/Iceking233/mwi-market-status
-// @version      2026.3.27.1
-// @description  银河奶牛市场历史成交量、价格、订单簿显示、收藏夹实时记录涨跌。
+// @version      2026.4.1.1
+// @description  Milky Way Idle market history, price chart, order book, and favorites tracking.
+// @description:zh-CN  银河奶牛市场历史成交量、价格、订单簿显示、收藏夹实时记录涨跌。
 // @author       Iceking233
 // @homepageURL  https://github.com/Iceking233/mwi-market-status
 // @supportURL   https://github.com/Iceking233/mwi-market-status/issues
@@ -10,6 +12,7 @@
 // @match        https://www.milkywayidlecn.com/*
 // @icon         https://www.milkywayidle.com/favicon.svg
 // @grant        none
+// @noframes
 // @require      https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js
 // @require      https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js
 // @require      https://cdn.jsdelivr.net/npm/chartjs-plugin-crosshair@2.0.0/dist/chartjs-plugin-crosshair.min.js
@@ -19,7 +22,7 @@
 // ==/UserScript==
 /*
 1. 感谢mooket作者IOMisaka，本插件在mooket的基础上开发，提供了更多功能和更好的用户体验！
-2. 感谢历史上提供过市场数据支持的项目与作者。
+2. 感谢q7提供市场数据支持。
 3. 感谢MWI Api作者holychikenz，提供了历史数据库！
 4. 感谢Joey、Baozhi、ColaCola、Hyh_fish的测试和大力支持！
 */
@@ -2233,18 +2236,23 @@
   new Promise(resolve => {
     let count = 0;
     const interval = setInterval(() => {
+      if (mwi.game && mwi.lang && mwi?.game?.state?.character?.gameMode) {//等待必须组件加载完毕后再初始化
+        clearInterval(interval);
+        resolve(true);
+        return;
+      }
       count++;
       if (count > 30) {
         console.warn("injecting failed，部分功能可能受到影响，可以尝试刷新页面或者关闭网页重开(Steam用户请忽略)");
-        clearInterval(interval)
-      }//最多等待30秒
-      if (mwi.game && mwi.lang && mwi?.game?.state?.character?.gameMode) {//等待必须组件加载完毕后再初始化
         clearInterval(interval);
-        resolve();
+        resolve(false);
       }
+      //最多等待30秒
     }, 1000);
-  }).then(() => {
-    injectedInit();
+  }).then((ready) => {
+    if (ready) {
+      injectedInit();
+    }
   });
 
   class ReconnectWebSocket {
@@ -5491,8 +5499,11 @@
           let currentItem = document.querySelector(".MarketplacePanel_currentItem__3ercC");
           let levelStr = currentItem?.querySelector(".Item_enhancementLevel__19g-e");
           let enhancementLevel = parseInt(levelStr?.textContent.replace("+", "") || "0");
-          let itemHrid = "/items/" + currentItem?.querySelector(".Icon_icon__2LtL_ use").href.baseVal.split("#")[1];
-          let itemHridLevel = itemHrid + ":" + enhancementLevel;
+          let iconUse = currentItem?.querySelector(".Icon_icon__2LtL_ use");
+          let iconHref = iconUse?.href?.baseVal || iconUse?.getAttribute("href") || iconUse?.getAttribute("xlink:href");
+          let iconId = iconHref?.split("#")[1];
+          let itemHrid = iconId ? "/items/" + iconId : null;
+          let itemHridLevel = itemHrid ? itemHrid + ":" + enhancementLevel : null;
           if (itemHrid && currentItem) {
             if (lastItemHridLevel !== itemHridLevel) {//防止重复请求
               //显示历史价格
@@ -5590,25 +5601,29 @@
   new Promise(resolve => {
     let count = 0;
     const interval = setInterval(() => {
-      count++;
-      if (count > 30) {
-        if (document.querySelector(".GamePage_gamePanel__3uNKN")) {
-          clearInterval(interval);
-          console.info("mooket 初始化超时，部分功能受限");
-          resolve();
-        } else {
-          //异常
-          clearInterval(interval);
-          console.info("mooket 初始化失败");
-        }
-      }//最多等待10秒
       if (document.body && mwi.character?.gameMode) {//等待必须组件加载完毕后再初始化
         clearInterval(interval);
-        resolve();
+        resolve(true);
+        return;
       }
+      count++;
+      if (count > 30) {
+        const hasGamePanel = !!document.querySelector(".GamePage_gamePanel__3uNKN");
+        clearInterval(interval);
+        if (hasGamePanel) {
+          console.info("mooket 初始化超时，部分功能受限");
+          resolve(true);
+        } else {
+          console.info("mooket 初始化失败");
+          resolve(false);
+        }
+      }
+      //最多等待10秒
     }, 1000);
-  }).then(() => {
-    mooket();
+  }).then((ready) => {
+    if (ready) {
+      mooket();
+    }
   });
 
 })();

@@ -2359,6 +2359,7 @@
   const SQLITE_HISTORY_MANIFEST_URL = "https://iceking233.github.io/mwi-market-status/history/sqlite/manifest.json";
   const FALLBACK_MARKET_API_URL = `${HOST}/market/api.json`;
   const LEGACY_HISTORY_URL = `${HOST}/market/item/history`;
+  const Q7_HISTORY_URL = "https://q7.nainai.eu.org/api/market/history";
   const HISTORY_DB_NAME = "MWIHistoryDB";
   const HISTORY_DB_VERSION = 1;
   const OFFICIAL_HISTORY_MANIFEST_TTL = 30 * 60 * 1000;
@@ -2512,6 +2513,116 @@
         latestTime: records[records.length - 1]?.time || null
       });
       return records.length;
+    }
+    async mergeHistorySeries(itemHrid, variant, rows, source = "history_import", options = {}) {
+      if (!itemHrid || !Array.isArray(rows) || rows.length === 0) return 0;
+      const db = await this.init();
+      if (!db) return 0;
+      const variantNumber = Number(variant) || 0;
+      const incomingRows = rows
+        .filter(row => row && Number(row.time) > 0)
+        .sort((left, right) => Number(left.time) - Number(right.time));
+      if (!incomingRows.length) return 0;
+
+      const minTime = Number(incomingRows[0]?.time || 0);
+      const maxTime = Number(incomingRows[incomingRows.length - 1]?.time || 0);
+      if (!minTime || !maxTime) return 0;
+
+      const existingRows = await new Promise((resolve, reject) => {
+        const tx = db.transaction("history_points", "readonly");
+        const index = tx.objectStore("history_points").index("item_variant_time");
+        const range = IDBKeyRange.bound(
+          [itemHrid, variantNumber, minTime],
+          [itemHrid, variantNumber, maxTime]
+        );
+        const request = index.getAll(range);
+        request.onsuccess = () => resolve((request.result || []).sort((a, b) => a.time - b.time));
+        request.onerror = () => reject(request.error);
+      }).catch(error => {
+        console.error("mergeHistorySeries preload failed", itemHrid, variant, source, error);
+        return [];
+      });
+
+      const byTime = new Map();
+      existingRows.forEach(row => {
+        const time = Number(row?.time) || 0;
+        if (!time) return;
+        byTime.set(time, {
+          time,
+          a: row.ask ?? row.a ?? null,
+          b: row.bid ?? row.b ?? null,
+          p: row.price ?? row.p ?? null,
+          v: row.volume ?? row.v ?? null,
+          source: row.source ?? null
+        });
+      });
+
+      let touched = 0;
+      incomingRows.forEach(row => {
+        const time = Number(row.time) || 0;
+        if (!time) return;
+        const previous = byTime.get(time) || {
+          time,
+          a: null,
+          b: null,
+          p: null,
+          v: null,
+          source: null
+        };
+        const next = { ...previous };
+        let changed = false;
+        const nextAsk = row.a ?? row.ask ?? null;
+        const nextBid = row.b ?? row.bid ?? null;
+        const nextPrice = row.p ?? row.price ?? null;
+        const nextVolume = row.v ?? row.volume ?? null;
+
+        if ((next.v == null || Number(next.v) <= 0) && nextVolume != null && Number(nextVolume) > 0) {
+          next.v = Number(nextVolume);
+          changed = true;
+        }
+        if ((next.p == null || Number(next.p) <= 0) && nextPrice != null && Number(nextPrice) > 0) {
+          next.p = Number(nextPrice);
+          changed = true;
+        }
+        if ((next.a == null || Number(next.a) < 0) && nextAsk != null && Number(nextAsk) >= 0) {
+          next.a = Number(nextAsk);
+          changed = true;
+        }
+        if ((next.b == null || Number(next.b) < 0) && nextBid != null && Number(nextBid) >= 0) {
+          next.b = Number(nextBid);
+          changed = true;
+        }
+        if (changed || !previous.source) {
+          next.source = source;
+          byTime.set(time, next);
+          touched += 1;
+        }
+      });
+
+      if (!touched) return 0;
+
+      const records = Array.from(byTime.values())
+        .sort((left, right) => Number(left.time) - Number(right.time))
+        .map(row => this.normalizePoint(itemHrid, variantNumber, row.time, row, row.source || source));
+
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction("history_points", "readwrite");
+        const store = tx.objectStore("history_points");
+        records.forEach(record => { store.put(record); });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      }).catch(error => {
+        console.error("mergeHistorySeries write failed", itemHrid, variant, source, error);
+      });
+
+      await this.setMeta(`history:${source}:${itemHrid}:${variantNumber}`, {
+        importedAt: Math.floor(Date.now() / 1000),
+        rows: records.length,
+        days: Number(options.days || 0) || 0,
+        earliestTime: records[0]?.time || null,
+        latestTime: records[records.length - 1]?.time || null
+      });
+      return touched;
     }
     async queryHistory(itemHrid, variant = 0, days = 1) {
       const db = await this.init();
@@ -4600,6 +4711,7 @@
 
     const officialHistoryInflight = new Map();
     const sqliteHistoryInflight = new Map();
+    const q7HistoryInflight = new Map();
 
     async function fetchOfficialHistory(itemHridName, level = 0, day = 1, signal) {
       const manifest = await fetchOfficialHistoryManifest(signal);
@@ -4686,6 +4798,62 @@
       sqliteHistoryInflight.set(cacheKey, requestPromise);
       return requestPromise.finally(() => {
         sqliteHistoryInflight.delete(cacheKey);
+      });
+    }
+
+    function normalizeQ7HistoryRows(payload) {
+      const rows = Array.isArray(payload) ? payload : payload?.data || payload?.rows || [];
+      if (!Array.isArray(rows)) return [];
+      return rows
+        .filter(row => Number(row?.time) > 0)
+        .map(row => ({
+          time: Number(row.time),
+          a: row.a ?? row.ask ?? -1,
+          b: row.b ?? row.bid ?? -1,
+          p: row.p ?? row.price ?? null,
+          v: row.v ?? row.volume ?? null
+        }))
+        .sort((left, right) => left.time - right.time);
+    }
+
+    async function fetchQ7VolumeHistory(itemHridName, level = 0, day = 1, signal) {
+      const cacheKey = `${itemHridName}:${Number(level) || 0}:${Number(day) || 1}`;
+      if (q7HistoryInflight.has(cacheKey)) {
+        return q7HistoryInflight.get(cacheKey);
+      }
+
+      const requestPromise = (async () => {
+        const url = new URL(Q7_HISTORY_URL);
+        url.searchParams.set("item_id", itemHridName);
+        url.searchParams.set("variant", String(Number(level) || 0));
+        url.searchParams.set("days", String(Math.max(1, Number(day) || 1)));
+        const response = await fetch(url, { signal, cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`Q7 history HTTP ${response.status}`);
+        }
+        const payload = await response.json();
+        const rows = normalizeQ7HistoryRows(payload);
+        if (!rows.length) return [];
+
+        await marketHistoryStore.mergeHistorySeries(
+          itemHridName,
+          level,
+          rows,
+          "third_party_history",
+          { days: Number(day) || 1 }
+        );
+        logHistoryDebug("q7_volume_history merged", {
+          itemHrid: itemHridName,
+          level: Number(level) || 0,
+          day: Number(day) || 1,
+          rows: rows.length
+        });
+        return rows;
+      })();
+
+      q7HistoryInflight.set(cacheKey, requestPromise);
+      return requestPromise.finally(() => {
+        q7HistoryInflight.delete(cacheKey);
       });
     }
 
@@ -4811,6 +4979,31 @@
             } catch (err) {
               if (err?.name === 'AbortError') return true;
               console.warn("SQLite 历史分片读取失败，保留本地快照", err);
+            }
+          }
+
+          const beforeQ7Rows = await marketHistoryStore.queryHistory(curHridName, curLevel, day);
+          const beforeQ7Stats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
+          if (marketHistoryStore.hasCoverage(beforeQ7Rows, day) && !hasUsableHistoricalVolume(beforeQ7Stats, day)) {
+            try {
+              const importedRows = await fetchQ7VolumeHistory(curHridName, curLevel, day, historyAbortController.signal);
+              if (
+                requestToken !== historyRequestToken ||
+                curHridName !== itemHridName ||
+                Number(curLevel) !== Number(level) ||
+                Number(curDay) !== Number(day)
+              ) {
+                return true;
+              }
+              if (importedRows.length > 0) {
+                const mergedRows = await marketHistoryStore.queryHistory(curHridName, curLevel, day);
+                const mergedStats = await marketHistoryStore.getHistoryStats(curHridName, curLevel, day);
+                updateChart(marketHistoryStore.toChartData(mergedRows, mergedStats, day), curDay);
+                if (marketHistoryStore.hasCoverage(mergedRows, day) && hasUsableHistoricalVolume(mergedStats, day)) return true;
+              }
+            } catch (err) {
+              if (err?.name === 'AbortError') return true;
+              console.warn("Q7 单物品成交量补洞失败，继续其他来源", err);
             }
           }
 

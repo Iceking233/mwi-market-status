@@ -1,1 +1,1 @@
-{"version":1,"source":"browser_history_import","itemHrid":"/items/ginkgo_water_staff","variant":1,"earliestTime":1774616983,"latestTime":1774616983,"rows":[{"time":1774616983,"a":380000,"b":-1,"p":null,"v":null,"source":"official_hourly"}]}
+{"version":1,"source":"official_marketplace_json","itemHrid":"/items/ginkgo_water_staff","variant":1,"earliestTime":1774616983,"latestTime":1775229013,"rows":[{"time":1774616983,"a":380000,"b":-1,"p":null,"v":null,"source":"official_hourly"},{"time":1775229013,"a":-1,"b":-1,"p":500000000,"v":1}]}

@@ -3455,8 +3455,8 @@
       },
       indicators: {
         ma: true,
-        boll: false,
-        spread: false
+        boll: true,
+        spread: true
       },
       favo: {}
     };
@@ -3464,9 +3464,15 @@
     config.favo = config.favo || {};
     config.indicators = Object.assign({
       ma: true,
-      boll: false,
-      spread: false
+      boll: true,
+      spread: true
     }, config.indicators || {});
+    if (config.indicatorsPresetVersion !== 2) {
+      config.indicators.ma = true;
+      config.indicators.boll = true;
+      config.indicators.spread = true;
+      config.indicatorsPresetVersion = 2;
+    }
 
     let trade_history = JSON.parse(localStorage.getItem("mooket_trade_history") || "{}");
     function trade_history_migrate() {
@@ -3693,11 +3699,6 @@
     updateMoodays();
     headerBar.appendChild(select);
 
-    const headerSpacer = document.createElement('div');
-    headerSpacer.style.flex = '1 1 auto';
-    headerSpacer.style.minWidth = '12px';
-    headerBar.appendChild(headerSpacer);
-
     const indicatorBar = document.createElement('div');
     indicatorBar.id = 'mooket_indicator_bar';
     indicatorBar.style.display = 'flex';
@@ -3706,9 +3707,14 @@
     indicatorBar.style.flexWrap = 'wrap';
     indicatorBar.style.gap = '6px';
     indicatorBar.style.minHeight = '30px';
-    indicatorBar.style.minWidth = '280px';
-    indicatorBar.style.padding = '0 2px';
+    indicatorBar.style.padding = '0';
+    indicatorBar.style.marginLeft = '0';
     headerBar.appendChild(indicatorBar);
+
+    const headerSpacer = document.createElement('div');
+    headerSpacer.style.flex = '1 1 auto';
+    headerSpacer.style.minWidth = '12px';
+    headerBar.appendChild(headerSpacer);
 
     const indicatorButtons = {};
 
@@ -3750,7 +3756,7 @@
       button.dataset.indicatorKey = key;
       button.style.height = '30px';
       button.style.padding = '0 12px';
-      button.style.borderRadius = '999px';
+      button.style.borderRadius = '8px';
       button.style.border = '1px solid #2f3541';
       button.style.background = '#1b2028';
       button.style.color = '#aeb7c3';
@@ -3758,6 +3764,7 @@
       button.style.fontSize = '12px';
       button.style.fontWeight = '600';
       button.style.letterSpacing = '0.01em';
+      button.style.minWidth = '76px';
       button.style.transition = 'background 120ms ease, border-color 120ms ease, color 120ms ease';
       button.onclick = () => {
         config.indicators[key] = !config.indicators[key];
@@ -4676,13 +4683,14 @@
 
     function renderExternalTooltip(context) {
       const tooltipModel = context?.tooltip;
-      if (!tooltipModel || tooltipModel.opacity === 0 || !tooltipModel.dataPoints?.length) {
+      const visiblePoints = tooltipModel?.dataPoints?.filter(point => !point.dataset?.mooketIndicator) || [];
+      if (!tooltipModel || tooltipModel.opacity === 0 || !visiblePoints.length) {
         hideExternalTooltip();
         return;
       }
 
       const title = tooltipModel.title?.[0] || '';
-      const rows = [...tooltipModel.dataPoints].sort((a, b) => {
+      const rows = [...visiblePoints].sort((a, b) => {
         return (a.dataset?.order ?? 99) - (b.dataset?.order ?? 99);
       }).map(point => {
         const color = point.dataset?.borderColor || point.dataset?.backgroundColor || '#d7dde6';
@@ -5436,34 +5444,43 @@
       });
     }
 
-    function buildBollingerBands(series, period = 20, multiplier = 2) {
+    function buildBollingerBands(askSeries, bidSeries, period = 20, multiplier = 2) {
       const upper = [];
+      const middle = [];
       const lower = [];
 
-      for (let index = 0; index < series.length; index++) {
-        if (!hasFullWindow(series, index, period)) {
+      for (let index = 0; index < askSeries.length; index++) {
+        if (!hasFullWindow(askSeries, index, period) || !hasFullWindow(bidSeries, index, period)) {
           upper.push(null);
+          middle.push(null);
           lower.push(null);
           continue;
         }
 
-        let sum = 0;
+        let askSum = 0;
+        let bidSum = 0;
         for (let i = index - period + 1; i <= index; i++) {
-          sum += Number(series[i]);
+          askSum += Number(askSeries[i]);
+          bidSum += Number(bidSeries[i]);
         }
-        const mean = sum / period;
+        const askMean = askSum / period;
+        const bidMean = bidSum / period;
 
-        let variance = 0;
+        let askVariance = 0;
+        let bidVariance = 0;
         for (let i = index - period + 1; i <= index; i++) {
-          variance += (Number(series[i]) - mean) ** 2;
+          askVariance += (Number(askSeries[i]) - askMean) ** 2;
+          bidVariance += (Number(bidSeries[i]) - bidMean) ** 2;
         }
 
-        const stdDev = Math.sqrt(variance / period);
-        upper.push(mean + stdDev * multiplier);
-        lower.push(mean - stdDev * multiplier);
+        const askStdDev = Math.sqrt(askVariance / period);
+        const bidStdDev = Math.sqrt(bidVariance / period);
+        upper.push(askMean + askStdDev * multiplier);
+        middle.push((askMean + bidMean) / 2);
+        lower.push(Math.max(0, bidMean - bidStdDev * multiplier));
       }
 
-      return { upper, lower };
+      return { upper, middle, lower };
     }
 
     function getAxisMaxTicks(range) {
@@ -5622,12 +5639,26 @@
         });
       }
 
-      metricBar.innerHTML = `
-        <span style="color:#ff4d4f;">${mwi.isZh ? '卖一' : 'Ask 1'} ${showNumber(lastAsk ?? '-')}</span>
-        <span style="color:#00c087;">${mwi.isZh ? '买一' : 'Bid 1'} ${showNumber(lastBid ?? '-')}</span>
-        <span style="color:#c8d1dc;">${mwi.isZh ? '价差' : 'Spread'} ${showNumber(lastSpread ?? '-')}</span>
-        <span style="color:rgba(255,255,255,0.72);">${mwi.isZh ? '今日成交量' : 'Today Vol'} ${showNumber(dayVolumeDisplay)}</span>
-      `;
+      const ma5Series = buildMovingAverage(midSeries, 5);
+      const ma10Series = buildMovingAverage(midSeries, 10);
+      const ma20Series = buildMovingAverage(midSeries, 20);
+      const bollBands = buildBollingerBands(askSeries, bidSeries, 20, 2);
+
+      const metricItems = [];
+      if (config.indicators.ma) {
+        metricItems.push(`<span style="color:rgba(96, 165, 250, 0.95);">MA5 ${showNumber(lastValid(ma5Series) ?? '-')}</span>`);
+        metricItems.push(`<span style="color:rgba(59, 130, 246, 0.88);">MA10 ${showNumber(lastValid(ma10Series) ?? '-')}</span>`);
+        metricItems.push(`<span style="color:rgba(29, 78, 216, 0.82);">MA20 ${showNumber(lastValid(ma20Series) ?? '-')}</span>`);
+      }
+      if (config.indicators.boll) {
+        metricItems.push(`<span style="color:rgba(255, 170, 72, 0.95);">${mwi.isZh ? '布林上' : 'Boll U'} ${showNumber(lastValid(bollBands.upper) ?? '-')}</span>`);
+        metricItems.push(`<span style="color:rgba(214, 110, 28, 0.98);">${mwi.isZh ? '布林中' : 'Boll M'} ${showNumber(lastValid(bollBands.middle) ?? '-')}</span>`);
+        metricItems.push(`<span style="color:rgba(255, 170, 72, 0.82);">${mwi.isZh ? '布林下' : 'Boll L'} ${showNumber(lastValid(bollBands.lower) ?? '-')}</span>`);
+      }
+      if (config.indicators.spread) {
+        metricItems.push(`<span style="color:rgba(255,255,255,0.78);">${mwi.isZh ? '价差线' : 'Spread'} ${showNumber(lastSpread ?? '-')}</span>`);
+      }
+      metricBar.innerHTML = metricItems.join('');
 
       renderChartStatus(historyStats);
 
@@ -5649,14 +5680,11 @@
         ...askSeries,
       ];
 
-      const maMidSeries = buildMovingAverage(midSeries, 5);
-      const bollBands = buildBollingerBands(midSeries, 20, 2);
-
       if (config.indicators.ma) {
-        allPriceSeries.push(...maMidSeries);
+        allPriceSeries.push(...ma5Series, ...ma10Series, ...ma20Series);
       }
       if (config.indicators.boll) {
-        allPriceSeries.push(...bollBands.upper, ...bollBands.lower);
+        allPriceSeries.push(...bollBands.upper, ...bollBands.middle, ...bollBands.lower);
       }
 
       const validPriceSeries = allPriceSeries.filter(v => v !== null && v !== undefined && !isNaN(v));
@@ -5710,14 +5738,41 @@
         datasets.push({
           type: 'line',
           label: mwi.isZh ? 'MA5(mid)' : 'MA5(mid)',
-          data: maMidSeries,
+          data: ma5Series,
           yAxisID: 'y',
-          borderColor: 'rgba(143, 180, 255, 0.9)',
-          backgroundColor: 'rgba(143, 180, 255, 0.9)',
+          borderColor: 'rgba(96, 165, 250, 0.95)',
+          backgroundColor: 'rgba(96, 165, 250, 0.95)',
           borderWidth: 1.2,
           pointRadius: 0,
           spanGaps: false,
-          order: 6
+          order: 6,
+          mooketIndicator: true
+        });
+        datasets.push({
+          type: 'line',
+          label: mwi.isZh ? 'MA10(mid)' : 'MA10(mid)',
+          data: ma10Series,
+          yAxisID: 'y',
+          borderColor: 'rgba(59, 130, 246, 0.88)',
+          backgroundColor: 'rgba(59, 130, 246, 0.88)',
+          borderWidth: 1.1,
+          pointRadius: 0,
+          spanGaps: false,
+          order: 6,
+          mooketIndicator: true
+        });
+        datasets.push({
+          type: 'line',
+          label: mwi.isZh ? 'MA20(mid)' : 'MA20(mid)',
+          data: ma20Series,
+          yAxisID: 'y',
+          borderColor: 'rgba(29, 78, 216, 0.82)',
+          backgroundColor: 'rgba(29, 78, 216, 0.82)',
+          borderWidth: 1,
+          pointRadius: 0,
+          spanGaps: false,
+          order: 6,
+          mooketIndicator: true
         });
       }
 
@@ -5727,26 +5782,42 @@
           label: mwi.isZh ? '布林上轨' : 'Boll Upper',
           data: bollBands.upper,
           yAxisID: 'y',
-          borderColor: 'rgba(255, 214, 102, 0.72)',
-          backgroundColor: 'rgba(255, 214, 102, 0.72)',
+          borderColor: 'rgba(255, 170, 72, 0.95)',
+          backgroundColor: 'rgba(255, 170, 72, 0.16)',
           borderWidth: 1,
-          borderDash: [5, 4],
           pointRadius: 0,
           spanGaps: false,
-          order: 5
+          order: 5,
+          fill: false,
+          mooketIndicator: true
         });
         datasets.push({
           type: 'line',
           label: mwi.isZh ? '布林下轨' : 'Boll Lower',
           data: bollBands.lower,
           yAxisID: 'y',
-          borderColor: 'rgba(255, 214, 102, 0.58)',
-          backgroundColor: 'rgba(255, 214, 102, 0.58)',
+          borderColor: 'rgba(255, 170, 72, 0.9)',
+          backgroundColor: 'rgba(255, 170, 72, 0.12)',
           borderWidth: 1,
-          borderDash: [5, 4],
           pointRadius: 0,
           spanGaps: false,
-          order: 5
+          order: 5,
+          fill: '-1',
+          mooketIndicator: true
+        });
+        datasets.push({
+          type: 'line',
+          label: mwi.isZh ? '布林中轨' : 'Boll Mid',
+          data: bollBands.middle,
+          yAxisID: 'y',
+          borderColor: 'rgba(214, 110, 28, 0.98)',
+          backgroundColor: 'rgba(214, 110, 28, 0.98)',
+          borderWidth: 1.1,
+          pointRadius: 0,
+          spanGaps: false,
+          order: 5,
+          fill: false,
+          mooketIndicator: true
         });
       }
 
@@ -5762,7 +5833,8 @@
           pointRadius: 0,
           spanGaps: false,
           borderDash: [3, 3],
-          order: 7
+          order: 7,
+          mooketIndicator: true
         });
       }
 

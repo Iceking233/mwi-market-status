@@ -3453,10 +3453,20 @@
         ask: true,
         volume: true
       },
+      indicators: {
+        ma: true,
+        boll: false,
+        spread: false
+      },
       favo: {}
     };
 
     config.favo = config.favo || {};
+    config.indicators = Object.assign({
+      ma: true,
+      boll: false,
+      spread: false
+    }, config.indicators || {});
 
     let trade_history = JSON.parse(localStorage.getItem("mooket_trade_history") || "{}");
     function trade_history_migrate() {
@@ -3682,6 +3692,87 @@
     }
     updateMoodays();
     headerBar.appendChild(select);
+
+    const headerSpacer = document.createElement('div');
+    headerSpacer.style.flex = '1 1 auto';
+    headerSpacer.style.minWidth = '12px';
+    headerBar.appendChild(headerSpacer);
+
+    const indicatorBar = document.createElement('div');
+    indicatorBar.id = 'mooket_indicator_bar';
+    indicatorBar.style.display = 'flex';
+    indicatorBar.style.alignItems = 'center';
+    indicatorBar.style.justifyContent = 'flex-start';
+    indicatorBar.style.flexWrap = 'wrap';
+    indicatorBar.style.gap = '6px';
+    indicatorBar.style.minHeight = '30px';
+    indicatorBar.style.minWidth = '280px';
+    indicatorBar.style.padding = '0 2px';
+    headerBar.appendChild(indicatorBar);
+
+    const indicatorButtons = {};
+
+    function getIndicatorButtonLabel(key) {
+      switch (key) {
+        case 'ma':
+          return mwi.isZh ? 'MA(mid)' : 'MA(mid)';
+        case 'boll':
+          return mwi.isZh ? '布林线' : 'Boll';
+        case 'spread':
+          return mwi.isZh ? '价差线' : 'Spread';
+        default:
+          return key;
+      }
+    }
+
+    function applyIndicatorButtonState(button, active) {
+      button.style.background = active ? 'rgba(66, 133, 244, 0.18)' : '#1b2028';
+      button.style.borderColor = active ? 'rgba(96, 165, 250, 0.72)' : '#2f3541';
+      button.style.color = active ? '#dbeafe' : '#aeb7c3';
+      button.style.boxShadow = active ? 'inset 0 0 0 1px rgba(96, 165, 250, 0.12)' : 'none';
+    }
+
+    function rerenderCurrentChart() {
+      if (!lastChartPayload?.data) return;
+      updateChart(cloneChartDataPayload(lastChartPayload.data), lastChartPayload.day);
+    }
+
+    function updateIndicatorButtons() {
+      Object.entries(indicatorButtons).forEach(([key, button]) => {
+        button.textContent = getIndicatorButtonLabel(key);
+        applyIndicatorButtonState(button, !!config.indicators?.[key]);
+      });
+    }
+
+    function createIndicatorButton(key) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.dataset.indicatorKey = key;
+      button.style.height = '30px';
+      button.style.padding = '0 12px';
+      button.style.borderRadius = '999px';
+      button.style.border = '1px solid #2f3541';
+      button.style.background = '#1b2028';
+      button.style.color = '#aeb7c3';
+      button.style.cursor = 'pointer';
+      button.style.fontSize = '12px';
+      button.style.fontWeight = '600';
+      button.style.letterSpacing = '0.01em';
+      button.style.transition = 'background 120ms ease, border-color 120ms ease, color 120ms ease';
+      button.onclick = () => {
+        config.indicators[key] = !config.indicators[key];
+        updateIndicatorButtons();
+        rerenderCurrentChart();
+        save_config();
+      };
+      indicatorButtons[key] = button;
+      indicatorBar.appendChild(button);
+    }
+
+    createIndicatorButton('ma');
+    createIndicatorButton('boll');
+    createIndicatorButton('spread');
+    updateIndicatorButtons();
 
     function isResizeHandleHit(event) {
       if (uiContainer.style.display === 'none') return false;
@@ -4087,6 +4178,7 @@
 
     addEventListener("MWILangChanged", () => {
       updateMoodays();
+      updateIndicatorButtons();
       updateFavo();
       refreshCurrentItemHints();
       if (uiContainer.style.display === 'none') {
@@ -4590,15 +4682,8 @@
       }
 
       const title = tooltipModel.title?.[0] || '';
-      const tooltipOrder = { ask: 0, bid: 1, volume: 2 };
       const rows = [...tooltipModel.dataPoints].sort((a, b) => {
-        const aAxis = a.dataset?.yAxisID === 'volumeY' ? 'volume' : '';
-        const bAxis = b.dataset?.yAxisID === 'volumeY' ? 'volume' : '';
-        const aLabel = (a.dataset?.label || '').toLowerCase();
-        const bLabel = (b.dataset?.label || '').toLowerCase();
-        const aType = aAxis || (aLabel.includes('ask') || aLabel.includes('卖') ? 'ask' : (aLabel.includes('bid') || aLabel.includes('买') ? 'bid' : 'volume'));
-        const bType = bAxis || (bLabel.includes('ask') || bLabel.includes('卖') ? 'ask' : (bLabel.includes('bid') || bLabel.includes('买') ? 'bid' : 'volume'));
-        return (tooltipOrder[aType] ?? 99) - (tooltipOrder[bType] ?? 99);
+        return (a.dataset?.order ?? 99) - (b.dataset?.order ?? 99);
       }).map(point => {
         const color = point.dataset?.borderColor || point.dataset?.backgroundColor || '#d7dde6';
         const label = point.dataset?.label || '';
@@ -4684,7 +4769,8 @@
           ticks: {
             color: "#9aa4b2",
             autoSkip: true,
-            maxTicksLimit: 10,
+            autoSkipPadding: 18,
+            maxTicksLimit: 6,
             maxRotation: 0,
             minRotation: 0,
             padding: 8,
@@ -4714,6 +4800,17 @@
             color: "#6f7a88",
             callback: showNumber,
             maxTicksLimit: 3
+          }
+        },
+        spreadY: {
+          position: 'left',
+          display: false,
+          beginAtZero: true,
+          grid: {
+            display: false
+          },
+          ticks: {
+            display: false
           }
         }
       },
@@ -5230,11 +5327,7 @@
       const shortYear = String(date.getFullYear()).slice(-2);
 
       if (Number(range) <= 3) return `${hours}:${minutes}`;
-      if (mwi.isZh) {
-        if (Number(range) <= 20) return `${month}月${day}日 ${hours}:${minutes}`;
-        return `${shortYear}年${month}月`;
-      }
-      if (Number(range) <= 20) return `${month}/${day} ${hours}:${minutes}`;
+      if (Number(range) <= 60) return `${month}/${day}`;
       return `${shortYear}/${month}`;
     }
 
@@ -5308,9 +5401,82 @@
     function renderChartStatus() {
       return;
     }
+
+    let lastChartPayload = null;
+
+    function cloneChartRows(rows) {
+      return Array.isArray(rows) ? rows.map(row => ({ ...row })) : [];
+    }
+
+    function cloneChartDataPayload(data) {
+      return {
+        ...data,
+        bid: cloneChartRows(data?.bid || data?.bids),
+        ask: cloneChartRows(data?.ask || data?.asks),
+        stats: data?.stats ? { ...data.stats } : {}
+      };
+    }
+
+    function hasFullWindow(series, endIndex, period) {
+      if (endIndex - period + 1 < 0) return false;
+      for (let i = endIndex - period + 1; i <= endIndex; i++) {
+        if (!Number.isFinite(series[i])) return false;
+      }
+      return true;
+    }
+
+    function buildMovingAverage(series, period) {
+      return series.map((_, index) => {
+        if (!hasFullWindow(series, index, period)) return null;
+        let sum = 0;
+        for (let i = index - period + 1; i <= index; i++) {
+          sum += Number(series[i]);
+        }
+        return sum / period;
+      });
+    }
+
+    function buildBollingerBands(series, period = 20, multiplier = 2) {
+      const upper = [];
+      const lower = [];
+
+      for (let index = 0; index < series.length; index++) {
+        if (!hasFullWindow(series, index, period)) {
+          upper.push(null);
+          lower.push(null);
+          continue;
+        }
+
+        let sum = 0;
+        for (let i = index - period + 1; i <= index; i++) {
+          sum += Number(series[i]);
+        }
+        const mean = sum / period;
+
+        let variance = 0;
+        for (let i = index - period + 1; i <= index; i++) {
+          variance += (Number(series[i]) - mean) ** 2;
+        }
+
+        const stdDev = Math.sqrt(variance / period);
+        upper.push(mean + stdDev * multiplier);
+        lower.push(mean - stdDev * multiplier);
+      }
+
+      return { upper, lower };
+    }
+
+    function getAxisMaxTicks(range) {
+      if (Number(range) <= 3) return 6;
+      if (Number(range) <= 20) return 5;
+      if (Number(range) <= 60) return 4;
+      if (Number(range) <= 180) return 5;
+      return 6;
+    }
     
     //data={'bid':[{time:1,price:1}],'ask':[{time:1,price:1}]}
     function updateChart(data, day) {
+      lastChartPayload = { data: cloneChartDataPayload(data), day: Number(day) || 1 };
       data.bid = data.bid || data.bids || [];
       data.ask = data.ask || data.asks || [];
 
@@ -5367,6 +5533,7 @@
       const askSeries = [];
       const volumeSeries = [];
       const midSeries = [];
+      const spreadSeries = [];
 
       for (let i = 0; i < len; i++) {
         const bidItem = data.bid[i];
@@ -5390,12 +5557,16 @@
 
         if (bid != null && ask != null) {
           midSeries.push((bid + ask) / 2);
+          spreadSeries.push(ask - bid);
         } else if (ask != null) {
           midSeries.push(ask);
+          spreadSeries.push(null);
         } else if (bid != null) {
           midSeries.push(bid);
+          spreadSeries.push(null);
         } else {
           midSeries.push(null);
+          spreadSeries.push(null);
         }
       }
 
@@ -5476,14 +5647,27 @@
       const allPriceSeries = [
         ...bidSeries,
         ...askSeries,
-      ].filter(v => v !== null && v !== undefined && !isNaN(v));
+      ];
 
-      const { min: yMin, max: yMax } = calcAxisBounds(allPriceSeries);
+      const maMidSeries = buildMovingAverage(midSeries, 5);
+      const bollBands = buildBollingerBands(midSeries, 20, 2);
+
+      if (config.indicators.ma) {
+        allPriceSeries.push(...maMidSeries);
+      }
+      if (config.indicators.boll) {
+        allPriceSeries.push(...bollBands.upper, ...bollBands.lower);
+      }
+
+      const validPriceSeries = allPriceSeries.filter(v => v !== null && v !== undefined && !isNaN(v));
+
+      const { min: yMin, max: yMax } = calcAxisBounds(validPriceSeries);
 
       chart.data.labels = labels;
       chart.options.plugins.title.text = curShowItemName;
+      chart.options.scales.x.ticks.maxTicksLimit = getAxisMaxTicks(day);
 
-      chart.data.datasets = [
+      const datasets = [
         {
           type: 'line',
           label: mwi.isZh ? '卖一' : 'Ask 1',
@@ -5494,7 +5678,7 @@
           borderWidth: 2,
           pointRadius: 0,
           spanGaps: false,
-          order: 1
+          order: 10
         },
         {
           type: 'line',
@@ -5506,7 +5690,7 @@
           borderWidth: 2,
           pointRadius: 0,
           spanGaps: false,
-          order: 1
+          order: 10
         },
         {
           type: 'bar',
@@ -5518,12 +5702,76 @@
           borderWidth: 1,
           barPercentage: 0.9,
           categoryPercentage: 0.9,
-          order: 9
+          order: 30
         }
       ];
 
+      if (config.indicators.ma) {
+        datasets.push({
+          type: 'line',
+          label: mwi.isZh ? 'MA5(mid)' : 'MA5(mid)',
+          data: maMidSeries,
+          yAxisID: 'y',
+          borderColor: 'rgba(143, 180, 255, 0.9)',
+          backgroundColor: 'rgba(143, 180, 255, 0.9)',
+          borderWidth: 1.2,
+          pointRadius: 0,
+          spanGaps: false,
+          order: 6
+        });
+      }
+
+      if (config.indicators.boll) {
+        datasets.push({
+          type: 'line',
+          label: mwi.isZh ? '布林上轨' : 'Boll Upper',
+          data: bollBands.upper,
+          yAxisID: 'y',
+          borderColor: 'rgba(255, 214, 102, 0.72)',
+          backgroundColor: 'rgba(255, 214, 102, 0.72)',
+          borderWidth: 1,
+          borderDash: [5, 4],
+          pointRadius: 0,
+          spanGaps: false,
+          order: 5
+        });
+        datasets.push({
+          type: 'line',
+          label: mwi.isZh ? '布林下轨' : 'Boll Lower',
+          data: bollBands.lower,
+          yAxisID: 'y',
+          borderColor: 'rgba(255, 214, 102, 0.58)',
+          backgroundColor: 'rgba(255, 214, 102, 0.58)',
+          borderWidth: 1,
+          borderDash: [5, 4],
+          pointRadius: 0,
+          spanGaps: false,
+          order: 5
+        });
+      }
+
+      if (config.indicators.spread) {
+        datasets.push({
+          type: 'line',
+          label: mwi.isZh ? '价差线' : 'Spread',
+          data: spreadSeries,
+          yAxisID: 'spreadY',
+          borderColor: 'rgba(255, 255, 255, 0.52)',
+          backgroundColor: 'rgba(255, 255, 255, 0.52)',
+          borderWidth: 1,
+          pointRadius: 0,
+          spanGaps: false,
+          borderDash: [3, 3],
+          order: 7
+        });
+      }
+
+      chart.data.datasets = datasets;
+
       chart.options.scales.y.min = yMin;
       chart.options.scales.y.max = yMax;
+      const validSpreadSeries = spreadSeries.filter(v => Number.isFinite(v) && v >= 0);
+      chart.options.scales.spreadY.max = validSpreadSeries.length ? Math.max(...validSpreadSeries) * 1.2 + 1 : 1;
       chart.update();
     }
 

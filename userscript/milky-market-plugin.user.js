@@ -2,7 +2,7 @@
 // @name         MWI Market Status
 // @name:zh-CN   MWI 市场状态增强
 // @namespace    https://github.com/Iceking233/mwi-market-status
-// @version      2026.4.1.1
+// @version      2026.4.3.2
 // @description  Milky Way Idle market history, price chart, order book, and favorites tracking.
 // @description:zh-CN  银河奶牛市场历史成交量、价格、订单簿显示、收藏夹实时记录涨跌。
 // @author       Iceking233
@@ -4679,6 +4679,39 @@
     function hideExternalTooltip() {
       externalTooltip.style.display = 'none';
       externalTooltip.innerHTML = '';
+      renderMetricBar();
+    }
+
+    let metricBarState = null;
+
+    function renderMetricBar(dataIndex = null) {
+      if (!metricBarState) {
+        metricBar.innerHTML = '';
+        return;
+      }
+
+      const resolveValue = (series, latestValue) => {
+        if (dataIndex == null || !Array.isArray(series)) return latestValue;
+        const pointValue = series[dataIndex];
+        return pointValue != null && !isNaN(pointValue) ? pointValue : latestValue;
+      };
+
+      const metricItems = [];
+      if (config.indicators.ma) {
+        metricItems.push(`<span style="color:rgba(147, 197, 253, 0.98);">MA5 ${showNumber(resolveValue(metricBarState.ma5Series, metricBarState.lastMa5) ?? '-')}</span>`);
+        metricItems.push(`<span style="color:rgba(125, 211, 252, 0.95);">MA10 ${showNumber(resolveValue(metricBarState.ma10Series, metricBarState.lastMa10) ?? '-')}</span>`);
+        metricItems.push(`<span style="color:rgba(191, 219, 254, 0.98);">MA20 ${showNumber(resolveValue(metricBarState.ma20Series, metricBarState.lastMa20) ?? '-')}</span>`);
+      }
+      if (config.indicators.boll) {
+        metricItems.push(`<span style="color:rgba(255, 170, 72, 0.95);">${mwi.isZh ? '布林上' : 'Boll U'} ${showNumber(resolveValue(metricBarState.bollUpperSeries, metricBarState.lastBollUpper) ?? '-')}</span>`);
+        metricItems.push(`<span style="color:rgba(214, 110, 28, 0.98);">${mwi.isZh ? '布林中' : 'Boll M'} ${showNumber(resolveValue(metricBarState.bollMiddleSeries, metricBarState.lastBollMiddle) ?? '-')}</span>`);
+        metricItems.push(`<span style="color:rgba(255, 170, 72, 0.82);">${mwi.isZh ? '布林下' : 'Boll L'} ${showNumber(resolveValue(metricBarState.bollLowerSeries, metricBarState.lastBollLower) ?? '-')}</span>`);
+      }
+      if (config.indicators.spread) {
+        metricItems.push(`<span style="color:rgba(255,255,255,0.78);">${mwi.isZh ? '价差线' : 'Spread'} ${showNumber(resolveValue(metricBarState.spreadSeries, metricBarState.lastSpread) ?? '-')}</span>`);
+      }
+
+      metricBar.innerHTML = metricItems.join('');
     }
 
     function renderExternalTooltip(context) {
@@ -4688,6 +4721,9 @@
         hideExternalTooltip();
         return;
       }
+
+      const hoveredIndex = visiblePoints[0]?.dataIndex;
+      renderMetricBar(Number.isInteger(hoveredIndex) ? hoveredIndex : null);
 
       const title = tooltipModel.title?.[0] || '';
       const rows = [...visiblePoints].sort((a, b) => {
@@ -5524,6 +5560,7 @@
 
       const len = Math.min(data.bid.length, data.ask.length);
       if (!len) {
+        metricBarState = null;
         chart.data.labels = [];
         chart.data.datasets = [];
         metricBar.innerHTML = '';
@@ -5643,22 +5680,23 @@
       const ma10Series = buildMovingAverage(midSeries, 10);
       const ma20Series = buildMovingAverage(midSeries, 20);
       const bollBands = buildBollingerBands(askSeries, bidSeries, 20, 2);
-
-      const metricItems = [];
-      if (config.indicators.ma) {
-        metricItems.push(`<span style="color:rgba(96, 165, 250, 0.95);">MA5 ${showNumber(lastValid(ma5Series) ?? '-')}</span>`);
-        metricItems.push(`<span style="color:rgba(59, 130, 246, 0.88);">MA10 ${showNumber(lastValid(ma10Series) ?? '-')}</span>`);
-        metricItems.push(`<span style="color:rgba(29, 78, 216, 0.82);">MA20 ${showNumber(lastValid(ma20Series) ?? '-')}</span>`);
-      }
-      if (config.indicators.boll) {
-        metricItems.push(`<span style="color:rgba(255, 170, 72, 0.95);">${mwi.isZh ? '布林上' : 'Boll U'} ${showNumber(lastValid(bollBands.upper) ?? '-')}</span>`);
-        metricItems.push(`<span style="color:rgba(214, 110, 28, 0.98);">${mwi.isZh ? '布林中' : 'Boll M'} ${showNumber(lastValid(bollBands.middle) ?? '-')}</span>`);
-        metricItems.push(`<span style="color:rgba(255, 170, 72, 0.82);">${mwi.isZh ? '布林下' : 'Boll L'} ${showNumber(lastValid(bollBands.lower) ?? '-')}</span>`);
-      }
-      if (config.indicators.spread) {
-        metricItems.push(`<span style="color:rgba(255,255,255,0.78);">${mwi.isZh ? '价差线' : 'Spread'} ${showNumber(lastSpread ?? '-')}</span>`);
-      }
-      metricBar.innerHTML = metricItems.join('');
+      metricBarState = {
+        ma5Series,
+        ma10Series,
+        ma20Series,
+        bollUpperSeries: bollBands.upper,
+        bollMiddleSeries: bollBands.middle,
+        bollLowerSeries: bollBands.lower,
+        spreadSeries,
+        lastMa5: lastValid(ma5Series),
+        lastMa10: lastValid(ma10Series),
+        lastMa20: lastValid(ma20Series),
+        lastBollUpper: lastValid(bollBands.upper),
+        lastBollMiddle: lastValid(bollBands.middle),
+        lastBollLower: lastValid(bollBands.lower),
+        lastSpread
+      };
+      renderMetricBar();
 
       renderChartStatus(historyStats);
 
@@ -5740,8 +5778,8 @@
           label: mwi.isZh ? 'MA5(mid)' : 'MA5(mid)',
           data: ma5Series,
           yAxisID: 'y',
-          borderColor: 'rgba(96, 165, 250, 0.95)',
-          backgroundColor: 'rgba(96, 165, 250, 0.95)',
+          borderColor: 'rgba(147, 197, 253, 0.98)',
+          backgroundColor: 'rgba(147, 197, 253, 0.98)',
           borderWidth: 1.2,
           pointRadius: 0,
           spanGaps: false,
@@ -5753,8 +5791,8 @@
           label: mwi.isZh ? 'MA10(mid)' : 'MA10(mid)',
           data: ma10Series,
           yAxisID: 'y',
-          borderColor: 'rgba(59, 130, 246, 0.88)',
-          backgroundColor: 'rgba(59, 130, 246, 0.88)',
+          borderColor: 'rgba(125, 211, 252, 0.95)',
+          backgroundColor: 'rgba(125, 211, 252, 0.95)',
           borderWidth: 1.1,
           pointRadius: 0,
           spanGaps: false,
@@ -5766,8 +5804,8 @@
           label: mwi.isZh ? 'MA20(mid)' : 'MA20(mid)',
           data: ma20Series,
           yAxisID: 'y',
-          borderColor: 'rgba(29, 78, 216, 0.82)',
-          backgroundColor: 'rgba(29, 78, 216, 0.82)',
+          borderColor: 'rgba(191, 219, 254, 0.98)',
+          backgroundColor: 'rgba(191, 219, 254, 0.98)',
           borderWidth: 1,
           pointRadius: 0,
           spanGaps: false,

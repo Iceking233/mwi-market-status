@@ -2,7 +2,7 @@
 // @name         MWI Market Status
 // @name:zh-CN   MWI 市场状态增强
 // @namespace    https://github.com/Iceking233/mwi-market-status
-// @version      2026.4.3.2
+// @version      2026.4.3.4
 // @description  Milky Way Idle market history, price chart, order book, and favorites tracking.
 // @description:zh-CN  银河奶牛市场历史成交量、价格、订单簿显示、收藏夹实时记录涨跌。
 // @author       Iceking233

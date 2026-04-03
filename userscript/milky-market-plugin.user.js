@@ -130,13 +130,29 @@
     fetchWithTimeout: fetchWithTimeout,//带超时的fetch
   };
   window[injectSpace] = mwi;
+  function getBrowserLanguage() {
+    const langs = Array.isArray(navigator.languages) && navigator.languages.length
+      ? navigator.languages
+      : [navigator.language, navigator.userLanguage].filter(Boolean);
+    return (langs.find(Boolean) || "").toLowerCase();
+  }
+  function detectLocaleIsZh(lang) {
+    return typeof lang === "string" && lang.toLowerCase().startsWith("zh");
+  }
+  function getPreferredLanguage() {
+    return localStorage.getItem("i18nextLng") || getBrowserLanguage();
+  }
+  function refreshLanguageState() {
+    mwi.isZh = detectLocaleIsZh(getPreferredLanguage());
+    return mwi.isZh;
+  }
   try {
     let decData = LZString.decompressFromUTF16(localStorage.getItem("initClientData"));
     mwi.initClientData = JSON.parse(decData);
   } catch {
     mwi.initClientData = JSON.parse("{}");
   }
-  mwi.isZh = localStorage.getItem("i18nextLng")?.startsWith("zh");
+  refreshLanguageState();
 
   const originalSetItem = localStorage.setItem;
   localStorage.setItem = function (key, value) {
@@ -152,9 +168,14 @@
   addEventListener('localStorageChanged', function (event) {
     if (event.key === "i18nextLng") {
       console.log(`i18nextLng changed: ${event.key} = ${event.newValue}`);
-      mwi.isZh = event.newValue?.startsWith("zh");
+      refreshLanguageState();
       dispatchEvent(new Event("MWILangChanged"));
     }
+  });
+  addEventListener("languagechange", () => {
+    if (localStorage.getItem("i18nextLng")) return;
+    refreshLanguageState();
+    dispatchEvent(new Event("MWILangChanged"));
   });
   async function patchScript() {
     try {
@@ -3967,13 +3988,20 @@
           favoItemDiv.style.minWidth = '0';
           favoItemDiv.onclick = function () {
             let [itemHrid, level] = itemHridLevel.split(":")
+            const safeLevel = parseInt(level, 10) || 0;
+            mwi.game?.handleGoToMarketplace?.(itemHrid, safeLevel);//只使用官方接口跳转
             if (uiContainer.style.display === 'none') {
               delayItemHridName = itemHrid;
-              delayItemLevel = parseInt(level);
+              delayItemLevel = safeLevel;
             } else {
-              requestItemPrice(itemHrid, curDay, level);
+              setTimeout(() => {
+                try {
+                  requestItemPrice(itemHrid, curDay, safeLevel);
+                } catch (error) {
+                  console.warn("收藏跳转后的图表刷新失败", itemHrid, safeLevel, error);
+                }
+              }, 0);
             }
-            mwi.game?.handleGoToMarketplace(itemHrid, parseInt(level));//打开市场
             //toggleShow(true);
           };
           favoItemDiv.oncontextmenu = (event) => { event.preventDefault(); removeFavo(itemHridLevel); };
@@ -4011,8 +4039,8 @@
 
             <div style="display:flex;flex-direction:column;justify-content:center;gap:2px;min-width:0;flex:1;">
               <div style="display:flex;align-items:center;gap:8px;min-width:0;">
-                <span style="color:#ff6b6b;white-space:nowrap;">卖 ${priceDelta.ask}</span>
-                <span style="color:#20c997;white-space:nowrap;">买 ${priceDelta.bid}</span>
+                <span style="color:#ff6b6b;white-space:nowrap;">${mwi.isZh ? '卖' : 'Ask'} ${priceDelta.ask}</span>
+                <span style="color:#20c997;white-space:nowrap;">${mwi.isZh ? '买' : 'Bid'} ${priceDelta.bid}</span>
               </div>
             </div>
           </div>
@@ -4030,6 +4058,21 @@
     sendFavo();//初始化自选
     addEventListener('MWICoreItemPriceUpdated', updateFavo);
 
+    function refreshCurrentItemHints() {
+      const currentItem = document.querySelector(".MarketplacePanel_currentItem__3ercC");
+      const tradeHistoryDiv = document.querySelector("#mooket_tradeHistory");
+      const btnFavo = document.querySelector("#mooket_addFavo");
+      if (tradeHistoryDiv) {
+        tradeHistoryDiv.title = mwi.isZh ? "我的最近买/卖价格" : "My recent buy/sell price";
+      }
+      if (btnFavo) {
+        btnFavo.title = mwi.isZh ? "左键添加到自选，右键当前物品也可添加" : "Left click to add favorite, or right click the current item";
+      }
+      if (currentItem) {
+        currentItem.title = mwi.isZh ? "右键添加到自选" : "Right click to add favorite";
+      }
+    }
+
     // 监听订单簿更新消息
     if (typeof mwi.hookMessage === 'function') {
       mwi.hookMessage('market_item_order_books_updated', (msg) => {
@@ -4045,10 +4088,18 @@
     addEventListener("MWILangChanged", () => {
       updateMoodays();
       updateFavo();
+      refreshCurrentItemHints();
       if (uiContainer.style.display === 'none') {
         btn_close.value = mwi.isZh ? "📈显示图表" : "Show";
       } else {
         btn_close.value = mwi.isZh ? "📈隐藏图表" : "Hide";
+      }
+      if (curHridName) {
+        const nextHrid = curHridName;
+        const nextDay = curDay;
+        const nextLevel = curLevel;
+        curHridName = null;
+        requestItemPrice(nextHrid, nextDay, nextLevel);
       }
 
     });
@@ -4539,7 +4590,16 @@
       }
 
       const title = tooltipModel.title?.[0] || '';
-      const rows = tooltipModel.dataPoints.map(point => {
+      const tooltipOrder = { ask: 0, bid: 1, volume: 2 };
+      const rows = [...tooltipModel.dataPoints].sort((a, b) => {
+        const aAxis = a.dataset?.yAxisID === 'volumeY' ? 'volume' : '';
+        const bAxis = b.dataset?.yAxisID === 'volumeY' ? 'volume' : '';
+        const aLabel = (a.dataset?.label || '').toLowerCase();
+        const bLabel = (b.dataset?.label || '').toLowerCase();
+        const aType = aAxis || (aLabel.includes('ask') || aLabel.includes('卖') ? 'ask' : (aLabel.includes('bid') || aLabel.includes('买') ? 'bid' : 'volume'));
+        const bType = bAxis || (bLabel.includes('ask') || bLabel.includes('卖') ? 'ask' : (bLabel.includes('bid') || bLabel.includes('买') ? 'bid' : 'volume'));
+        return (tooltipOrder[aType] ?? 99) - (tooltipOrder[bType] ?? 99);
+      }).map(point => {
         const color = point.dataset?.borderColor || point.dataset?.backgroundColor || '#d7dde6';
         const label = point.dataset?.label || '';
         const value = showNumber(point.parsed?.y ?? point.raw ?? '-');
@@ -5170,8 +5230,12 @@
       const shortYear = String(date.getFullYear()).slice(-2);
 
       if (Number(range) <= 3) return `${hours}:${minutes}`;
-      if (Number(range) <= 20) return `${month}月${day}日 ${hours}:${minutes}`;
-      return `${shortYear}年${month}月`;
+      if (mwi.isZh) {
+        if (Number(range) <= 20) return `${month}月${day}日 ${hours}:${minutes}`;
+        return `${shortYear}年${month}月`;
+      }
+      if (Number(range) <= 20) return `${month}/${day} ${hours}:${minutes}`;
+      return `${shortYear}/${month}`;
     }
 
     function formatTooltipTime(value) {
@@ -5179,7 +5243,8 @@
       if (Number.isNaN(date.getTime())) return '';
       const hours = pad2(date.getHours());
       const minutes = pad2(date.getMinutes());
-      return `${date.getFullYear()}.${date.getMonth() + 1}.${date.getDate()} ${hours}:${minutes}`;
+      if (mwi.isZh) return `${date.getFullYear()}.${date.getMonth() + 1}.${date.getDate()} ${hours}:${minutes}`;
+      return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${hours}:${minutes}`;
     }
 
     function formatCompactNumber(value, suffix) {
@@ -5387,9 +5452,9 @@
       }
 
       metricBar.innerHTML = `
-        <span style="color:#00c087;">买一 ${showNumber(lastBid ?? '-')}</span>
-        <span style="color:#ff4d4f;">卖一 ${showNumber(lastAsk ?? '-')}</span>
-        <span style="color:#c8d1dc;">价差 ${showNumber(lastSpread ?? '-')}</span>
+        <span style="color:#ff4d4f;">${mwi.isZh ? '卖一' : 'Ask 1'} ${showNumber(lastAsk ?? '-')}</span>
+        <span style="color:#00c087;">${mwi.isZh ? '买一' : 'Bid 1'} ${showNumber(lastBid ?? '-')}</span>
+        <span style="color:#c8d1dc;">${mwi.isZh ? '价差' : 'Spread'} ${showNumber(lastSpread ?? '-')}</span>
         <span style="color:rgba(255,255,255,0.72);">${mwi.isZh ? '今日成交量' : 'Today Vol'} ${showNumber(dayVolumeDisplay)}</span>
       `;
 
@@ -5421,11 +5486,11 @@
       chart.data.datasets = [
         {
           type: 'line',
-          label: mwi.isZh ? '买一' : 'Bid 1',
-          data: bidSeries,
+          label: mwi.isZh ? '卖一' : 'Ask 1',
+          data: askSeries,
           yAxisID: 'y',
-          borderColor: '#00c087',
-          backgroundColor: '#00c087',
+          borderColor: '#ff4d4f',
+          backgroundColor: '#ff4d4f',
           borderWidth: 2,
           pointRadius: 0,
           spanGaps: false,
@@ -5433,11 +5498,11 @@
         },
         {
           type: 'line',
-          label: mwi.isZh ? '卖一' : 'Ask 1',
-          data: askSeries,
+          label: mwi.isZh ? '买一' : 'Bid 1',
+          data: bidSeries,
           yAxisID: 'y',
-          borderColor: '#ff4d4f',
-          backgroundColor: '#ff4d4f',
+          borderColor: '#00c087',
+          backgroundColor: '#00c087',
           borderWidth: 2,
           pointRadius: 0,
           spanGaps: false,

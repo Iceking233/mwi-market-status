@@ -4297,6 +4297,7 @@
         ctx.style.display = 'block';
         container.style.resize = "both";
         select.style.display = 'inline-flex';
+        indicatorBar.style.display = 'flex';
         headerBar.style.justifyContent = 'flex-start';
 
         btn_close.value = '📈' + (mwi.isZh ? "隐藏图表" : "Hide");
@@ -4330,6 +4331,7 @@
         favoContainer.style.display = 'none';
         container.style.resize = "none";
         select.style.display = 'none';
+        indicatorBar.style.display = 'none';
         headerBar.style.justifyContent = 'flex-start';
         headerBar.style.marginBottom = '0';
 

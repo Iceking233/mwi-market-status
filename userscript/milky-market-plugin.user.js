@@ -2740,15 +2740,20 @@
           time,
           bid: null,
           ask: null,
-          volume: null
+          volume: null,
+          price: null
         };
         const rowBid = row.bid ?? row.b;
         const rowAsk = row.ask ?? row.a;
         const rowVolume = row.volume ?? row.v;
+        const rowPrice = row.price ?? row.p ?? row.avgPrice ?? null;
         if (Number.isFinite(Number(rowBid)) && Number(rowBid) >= 0) point.bid = Number(rowBid);
         if (Number.isFinite(Number(rowAsk)) && Number(rowAsk) >= 0) point.ask = Number(rowAsk);
         if (rowVolume != null && Number.isFinite(Number(rowVolume)) && Number(rowVolume) >= 0) {
           point.volume = point.volume == null ? Number(rowVolume) : Math.max(point.volume, Number(rowVolume));
+        }
+        if (rowPrice != null && Number.isFinite(Number(rowPrice)) && Number(rowPrice) >= 0) {
+          point.price = Number(rowPrice);
         }
         pointsByTime.set(time, point);
       });
@@ -2761,19 +2766,29 @@
           time: bucketTime,
           bid: null,
           ask: null,
-          volume: null
+          volume: null,
+          price: null,
+          detailPoints: []
         };
         if (point.bid != null) bucket.bid = point.bid;
         if (point.ask != null) bucket.ask = point.ask;
         if (point.volume != null) bucket.volume = (bucket.volume ?? 0) + point.volume;
+        if (point.price != null) bucket.price = point.price;
+        bucket.detailPoints.push({
+          time: point.time,
+          ask: point.ask,
+          bid: point.bid,
+          price: point.price,
+          volume: point.volume
+        });
         bucketMap.set(bucketTime, bucket);
       });
 
       const bid = [];
       const ask = [];
       Array.from(bucketMap.values()).sort((a, b) => a.time - b.time).forEach(point => {
-        bid.push({ time: point.time, price: point.bid, volume: point.volume });
-        ask.push({ time: point.time, price: point.ask, volume: point.volume });
+        bid.push({ time: point.time, price: point.bid, volume: point.volume, avgPrice: point.price, detailPoints: point.detailPoints });
+        ask.push({ time: point.time, price: point.ask, volume: point.volume, avgPrice: point.price, detailPoints: point.detailPoints });
       });
       return { bid, ask, source: "indexeddb", stats };
     }
@@ -4011,6 +4026,16 @@
       save_config();
       sendFavo();
     }
+    function reorderFavoConfig() {
+      const nextFavo = {};
+      Array.from(favoContainer.children).forEach(child => {
+        if (child?.id && config.favo[child.id]) {
+          nextFavo[child.id] = config.favo[child.id];
+        }
+      });
+      config.favo = nextFavo;
+      save_config();
+    }
     function getItemHridLevelFromElement(itemRoot) {
       if (!itemRoot) return null;
       const useEl = itemRoot.querySelector('svg.Icon_icon__2LtL_ use, [class*="Icon_icon__"] use');
@@ -4084,7 +4109,9 @@
           favoItemDiv.style.cursor = 'pointer';
           favoItemDiv.style.width = '100%';
           favoItemDiv.style.minWidth = '0';
+          favoItemDiv.draggable = true;
           favoItemDiv.onclick = function () {
+            if (favoItemDiv.dataset.dragging === "true") return;
             let [itemHrid, level] = itemHridLevel.split(":")
             const safeLevel = parseInt(level, 10) || 0;
             mwi.game?.handleGoToMarketplace?.(itemHrid, safeLevel);//只使用官方接口跳转
@@ -4101,6 +4128,27 @@
               }, 0);
             }
             //toggleShow(true);
+          };
+          favoItemDiv.ondragstart = event => {
+            favoItemDiv.dataset.dragging = "true";
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", favoItemDiv.id);
+            favoItemDiv.style.opacity = "0.5";
+          };
+          favoItemDiv.ondragend = () => {
+            delete favoItemDiv.dataset.dragging;
+            favoItemDiv.style.opacity = "1";
+            reorderFavoConfig();
+          };
+          favoItemDiv.ondragover = event => {
+            event.preventDefault();
+            const draggingId = event.dataTransfer.getData("text/plain") || document.querySelector('[data-dragging="true"]')?.id;
+            if (!draggingId || draggingId === favoItemDiv.id) return;
+            const draggingEl = document.getElementById(draggingId);
+            if (!draggingEl || draggingEl.parentElement !== favoContainer) return;
+            const rect = favoItemDiv.getBoundingClientRect();
+            const insertAfter = (event.clientY - rect.top) > (rect.height / 2);
+            favoContainer.insertBefore(draggingEl, insertAfter ? favoItemDiv.nextSibling : favoItemDiv);
           };
           favoItemDiv.oncontextmenu = (event) => { event.preventDefault(); removeFavo(itemHridLevel); };
           favoItemDiv.id = itemHridLevel;
@@ -4742,9 +4790,37 @@
         `;
       }).join('');
 
+      const volumePoint = visiblePoints.find(point => point.dataset?.mooketVolumeMeta?.estimates);
+      let extraRows = '';
+      if (volumePoint) {
+        const estimate = volumePoint.dataset.mooketVolumeMeta.estimates?.[hoveredIndex];
+        if (estimate) {
+          const confidenceInfo = getConfidenceLabel(estimate.confidence);
+          extraRows = `
+            <div style="height:1px;background:rgba(255,255,255,0.08);margin:6px 0 2px;"></div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span style="width:10px;height:10px;border-radius:2px;background:rgba(255,255,255,0.36);box-shadow:0 0 0 2px rgba(255,255,255,0.12) inset;"></span>
+              <span style="color:#d7dde6;">${mwi.isZh ? '卖一成交(估)' : 'Est. Ask'}: ${showNumber(estimate.askVolume)}</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span style="width:10px;height:10px;border-radius:2px;background:rgba(255,255,255,0.36);box-shadow:0 0 0 2px rgba(255,255,255,0.12) inset;"></span>
+              <span style="color:#d7dde6;">${mwi.isZh ? '买一成交(估)' : 'Est. Bid'}: ${showNumber(estimate.bidVolume)}</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span style="width:10px;height:10px;border-radius:2px;background:rgba(255,255,255,0.20);box-shadow:0 0 0 2px rgba(255,255,255,0.12) inset;"></span>
+              <span style="color:#d7dde6;">${mwi.isZh ? '估算区间' : 'Range'}: ${mwi.isZh ? '卖一' : 'Ask'} ${showNumber(estimate.askMin)}-${showNumber(estimate.askMax)} / ${mwi.isZh ? '买一' : 'Bid'} ${showNumber(estimate.bidMin)}-${showNumber(estimate.bidMax)}</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span style="width:10px;height:10px;border-radius:2px;background:rgba(255,255,255,0.20);box-shadow:0 0 0 2px rgba(255,255,255,0.12) inset;"></span>
+              <span style="color:#d7dde6;">${mwi.isZh ? '置信度' : 'Confidence'}: ${confidenceInfo.label} (${confidenceInfo.pct}%)</span>
+            </div>
+          `;
+        }
+      }
+
       externalTooltip.innerHTML = `
         <div style="font-size:13px;font-weight:700;color:#ffffff;margin-bottom:${rows ? '8px' : '0'};">${title}</div>
-        <div style="display:flex;flex-direction:column;gap:4px;">${rows}</div>
+        <div style="display:flex;flex-direction:column;gap:4px;">${rows}${extraRows}</div>
       `;
       externalTooltip.style.display = 'block';
 
@@ -5528,6 +5604,157 @@
       if (Number(range) <= 180) return 5;
       return 6;
     }
+
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function getConfidenceLabel(confidence) {
+      const pct = Math.round(clamp(Number(confidence) || 0, 0, 1) * 100);
+      const label = pct >= 75
+        ? (mwi.isZh ? '高' : 'High')
+        : pct >= 50
+          ? (mwi.isZh ? '中' : 'Medium')
+          : (mwi.isZh ? '低' : 'Low');
+      return { pct, label };
+    }
+
+    function estimateVolumeSplit(points, orderBook = currentOrderBook) {
+      const imbalanceNow = clamp(((Number(orderBook?.askPct) || 50) - 50) / 50, -1, 1);
+      return points.map((point, index) => {
+        const volume = Math.max(0, Number(point?.volume) || 0);
+        const ask = Number(point?.ask);
+        const bid = Number(point?.bid);
+        const price = Number(point?.price);
+        let askRatioCenter = 0.5;
+        let askRatioMin = 0.35;
+        let askRatioMax = 0.65;
+        let confidence = volume > 0 ? 0.2 : 0.05;
+
+        if (volume > 0) {
+          if (Number.isFinite(ask) && ask > 0 && Number.isFinite(bid) && bid > 0 && ask > bid) {
+            const mid = (ask + bid) / 2;
+            const spread = ask - bid;
+            const spreadHalf = Math.max(spread / 2, 1);
+            const pricePosition = Number.isFinite(price)
+              ? clamp((price - mid) / spreadHalf, -1, 1)
+              : 0;
+
+            let trendSignal = 0;
+            let trendStrength = 0;
+            const prev = points[index - 1];
+            if (prev && Number.isFinite(prev.ask) && prev.ask > 0 && Number.isFinite(prev.bid) && prev.bid > 0 && prev.ask > prev.bid) {
+              const prevMid = (prev.ask + prev.bid) / 2;
+              if (prevMid > 0) {
+                const delta = (mid - prevMid) / prevMid;
+                trendSignal = clamp(delta / 0.03, -1, 1);
+                trendStrength = Math.abs(trendSignal);
+              }
+            }
+
+            const centerSignal = clamp(pricePosition * 0.68 + trendSignal * 0.22 + imbalanceNow * 0.10, -1, 1);
+            askRatioCenter = clamp(0.5 + centerSignal * 0.5, 0, 1);
+
+            const priceStrength = Math.abs(pricePosition);
+            const spreadPenalty = clamp(spread / Math.max(mid, 1), 0, 1);
+            const agreement = trendStrength > 0 ? (1 - Math.abs(pricePosition - trendSignal) / 2) : 0.6;
+            const volumeStrength = clamp(Math.log10(volume + 1) / 6, 0, 1);
+            const orderBookStrength = Math.abs(imbalanceNow);
+
+            confidence = clamp(
+              0.18
+              + priceStrength * 0.28
+              + trendStrength * 0.22
+              + agreement * 0.14
+              + volumeStrength * 0.12
+              + orderBookStrength * 0.08
+              - spreadPenalty * 0.32,
+              0.1,
+              0.95
+            );
+
+            const uncertainty = clamp(
+              0.40
+              - confidence * 0.24
+              + spreadPenalty * 0.16
+              + (1 - agreement) * 0.10,
+              0.08,
+              0.46
+            );
+            askRatioMin = clamp(askRatioCenter - uncertainty / 2, 0, 1);
+            askRatioMax = clamp(askRatioCenter + uncertainty / 2, 0, 1);
+          } else if (Number.isFinite(bid) && bid > 0) {
+            askRatioCenter = 0.75;
+            askRatioMin = 0.55;
+            askRatioMax = 0.92;
+            confidence = 0.32;
+          } else if (Number.isFinite(ask) && ask > 0) {
+            askRatioCenter = 0.25;
+            askRatioMin = 0.08;
+            askRatioMax = 0.45;
+            confidence = 0.32;
+          }
+        }
+
+        const askVolume = Math.round(volume * askRatioCenter);
+        const bidVolume = Math.round(volume - askVolume);
+        return {
+          askVolume,
+          bidVolume,
+          askMin: Math.round(volume * askRatioMin),
+          askMax: Math.round(volume * askRatioMax),
+          bidMin: Math.round(volume * (1 - askRatioMax)),
+          bidMax: Math.round(volume * (1 - askRatioMin)),
+          confidence
+        };
+      });
+    }
+
+    function summarizeVolumeEstimateRows(rows) {
+      const validRows = Array.isArray(rows) ? rows : [];
+      if (!validRows.length) {
+        return {
+          askVolume: 0,
+          bidVolume: 0,
+          askMin: 0,
+          askMax: 0,
+          bidMin: 0,
+          bidMax: 0,
+          confidence: 0.05
+        };
+      }
+
+      let askVolume = 0;
+      let bidVolume = 0;
+      let askMin = 0;
+      let askMax = 0;
+      let bidMin = 0;
+      let bidMax = 0;
+      let weightedConfidence = 0;
+      let totalVolume = 0;
+
+      for (const row of validRows) {
+        askVolume += Number(row.askVolume) || 0;
+        bidVolume += Number(row.bidVolume) || 0;
+        askMin += Number(row.askMin) || 0;
+        askMax += Number(row.askMax) || 0;
+        bidMin += Number(row.bidMin) || 0;
+        bidMax += Number(row.bidMax) || 0;
+        const rowVolume = (Number(row.askVolume) || 0) + (Number(row.bidVolume) || 0);
+        totalVolume += rowVolume;
+        weightedConfidence += (Number(row.confidence) || 0) * rowVolume;
+      }
+
+      return {
+        askVolume,
+        bidVolume,
+        askMin,
+        askMax,
+        bidMin,
+        bidMax,
+        confidence: totalVolume > 0 ? weightedConfidence / totalVolume : (validRows[0]?.confidence ?? 0.05)
+      };
+    }
     
     //data={'bid':[{time:1,price:1}],'ask':[{time:1,price:1}]}
     function updateChart(data, day) {
@@ -5590,6 +5817,7 @@
       const volumeSeries = [];
       const midSeries = [];
       const spreadSeries = [];
+      const tradePriceSeries = [];
 
       for (let i = 0; i < len; i++) {
         const bidItem = data.bid[i];
@@ -5610,6 +5838,15 @@
           bidItem.v ??
           null;
         volumeSeries.push(volume);
+        tradePriceSeries.push(
+          askItem.avgPrice ??
+          bidItem.avgPrice ??
+          askItem.p ??
+          bidItem.p ??
+          askItem.priceAvg ??
+          bidItem.priceAvg ??
+          null
+        );
 
         if (bid != null && ask != null) {
           midSeries.push((bid + ask) / 2);
@@ -5682,6 +5919,20 @@
       const ma10Series = buildMovingAverage(midSeries, 10);
       const ma20Series = buildMovingAverage(midSeries, 20);
       const bollBands = buildBollingerBands(askSeries, bidSeries, 20, 2);
+      const volumeEstimates = labels.map((label, index) => {
+        const askItem = data.ask[index];
+        const detailPoints = Array.isArray(askItem?.detailPoints) && askItem.detailPoints.length
+          ? askItem.detailPoints
+          : [{
+              time: label,
+              ask: askSeries[index],
+              bid: bidSeries[index],
+              price: tradePriceSeries[index],
+              volume: volumeSeries[index]
+            }];
+        const detailEstimates = estimateVolumeSplit(detailPoints, currentOrderBook);
+        return summarizeVolumeEstimateRows(detailEstimates);
+      });
       metricBarState = {
         ma5Series,
         ma10Series,
@@ -5770,7 +6021,10 @@
           borderWidth: 1,
           barPercentage: 0.9,
           categoryPercentage: 0.9,
-          order: 30
+          order: 30,
+          mooketVolumeMeta: {
+            estimates: volumeEstimates
+          }
         }
       ];
 

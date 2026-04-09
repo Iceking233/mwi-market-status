@@ -2,7 +2,7 @@
 // @name         MWI Market Status
 // @name:zh-CN   MWI 市场状态增强
 // @namespace    https://github.com/Iceking233/mwi-market-status
-// @version      2026.4.3.4
+// @version      2026.4.9.1
 // @description  Milky Way Idle market history, price chart, order book, and favorites tracking.
 // @description:zh-CN  银河奶牛市场历史成交量、价格、订单簿显示、收藏夹实时记录涨跌。
 // @author       Iceking233
@@ -4822,7 +4822,12 @@
         return (a.dataset?.order ?? 99) - (b.dataset?.order ?? 99);
       }).map(point => {
         const color = point.dataset?.borderColor || point.dataset?.backgroundColor || '#d7dde6';
-        const label = point.dataset?.label || '';
+        const rawLabel = point.dataset?.label || '';
+        const label = rawLabel === '成交量'
+          ? '成交量(区间数据)'
+          : rawLabel === 'Volume'
+            ? 'Volume (Range Data)'
+            : rawLabel;
         const value = showNumber(point.parsed?.y ?? point.raw ?? '-');
         return `
           <div style="display:flex;align-items:center;gap:8px;">
@@ -4841,11 +4846,11 @@
           extraRows = `
             <div style="height:1px;background:rgba(255,255,255,0.08);margin:6px 0 2px;"></div>
             <div style="display:flex;align-items:center;gap:8px;">
-              <span style="width:10px;height:10px;border-radius:2px;background:rgba(255,255,255,0.36);box-shadow:0 0 0 2px rgba(255,255,255,0.12) inset;"></span>
+              <span style="width:10px;height:10px;border-radius:2px;background:#ef4444;box-shadow:0 0 0 2px rgba(255,255,255,0.12) inset;"></span>
               <span style="color:#d7dde6;">${mwi.isZh ? '卖一成交(估)' : 'Est. Ask'}: ${showNumber(estimate.askVolume)}</span>
             </div>
             <div style="display:flex;align-items:center;gap:8px;">
-              <span style="width:10px;height:10px;border-radius:2px;background:rgba(255,255,255,0.36);box-shadow:0 0 0 2px rgba(255,255,255,0.12) inset;"></span>
+              <span style="width:10px;height:10px;border-radius:2px;background:#22c55e;box-shadow:0 0 0 2px rgba(255,255,255,0.12) inset;"></span>
               <span style="color:#d7dde6;">${mwi.isZh ? '买一成交(估)' : 'Est. Bid'}: ${showNumber(estimate.bidVolume)}</span>
             </div>
             <div style="display:flex;align-items:center;gap:8px;">
@@ -4853,8 +4858,8 @@
               <span style="color:#d7dde6;">${mwi.isZh ? '估算区间' : 'Range'}: ${mwi.isZh ? '卖一' : 'Ask'} ${showNumber(estimate.askMin)}-${showNumber(estimate.askMax)} / ${mwi.isZh ? '买一' : 'Bid'} ${showNumber(estimate.bidMin)}-${showNumber(estimate.bidMax)}</span>
             </div>
             <div style="display:flex;align-items:center;gap:8px;">
-              <span style="width:10px;height:10px;border-radius:2px;background:rgba(255,255,255,0.20);box-shadow:0 0 0 2px rgba(255,255,255,0.12) inset;"></span>
-              <span style="color:#d7dde6;">${mwi.isZh ? '置信度' : 'Confidence'}: ${confidenceInfo.label} (${confidenceInfo.pct}%)</span>
+              <span style="width:10px;height:10px;border-radius:2px;background:${confidenceInfo.color};box-shadow:0 0 0 2px rgba(255,255,255,0.12) inset;"></span>
+              <span style="color:${confidenceInfo.color};">${mwi.isZh ? '置信度' : 'Confidence'}: ${confidenceInfo.label} (${confidenceInfo.pct}%)</span>
             </div>
           `;
         }
@@ -5664,7 +5669,12 @@
         : pct >= 50
           ? (mwi.isZh ? '中' : 'Medium')
           : (mwi.isZh ? '低' : 'Low');
-      return { pct, label };
+      const color = pct >= 75
+        ? '#22c55e'
+        : pct >= 50
+          ? '#facc15'
+          : '#ef4444';
+      return { pct, label, color };
     }
 
     function estimateVolumeSplit(points, orderBook = currentOrderBook) {

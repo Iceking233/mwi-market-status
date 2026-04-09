@@ -14,8 +14,23 @@ By default the script:
 2. Saves the raw snapshot to `docs/history/official/snapshots/YYYY/MM/DD/<timestamp>.json`.
 3. Updates `docs/history/official/latest.json`.
 4. Appends per-item/per-variant history shards under `docs/history/official/items/`.
-5. Rebuilds `docs/history/official/manifest.json`.
-6. Publishes GitHub Pages API entrypoints under `docs/market/`.
+5. Keeps the most recent 60 days at hourly precision and compacts older rows into daily points.
+6. Rebuilds `docs/history/official/manifest.json`.
+7. Publishes GitHub Pages API entrypoints under `docs/market/`.
+
+If `MWI_MARKET_DATA_DOCS_DIR` is set, those generated files are written into that external docs root instead of this repository's local `docs/`.
+
+You can override the retention window:
+
+```bash
+node bakcend/sync-official-market-history.mjs --hourly-retention-days 60
+```
+
+To compact existing shards in place:
+
+```bash
+node bakcend/compact-official-history.mjs --hourly-retention-days 60
+```
 
 ## GitHub automation
 

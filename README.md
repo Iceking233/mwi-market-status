@@ -24,5 +24,6 @@ The userscript currently stores market data in the browser, not on a server:
 - `docs/history/official/`: official snapshot archive, latest snapshot, and per-item history shards
 - `docs/market/`: GitHub Pages public API root for current market and manifests
 - `.github/workflows/sync-official-market-history.yml`: updates the official archive every 30 minutes
+- `MWI_MARKET_DATA_DOCS_DIR=/path/to/mwi-market-data/docs`: optional split-repo output root for generated history
 
 See [docs/official-history-source.md](docs/official-history-source.md), [docs/sqlite-history-source.md](docs/sqlite-history-source.md), and [docs/github-pages-actions-setup.md](docs/github-pages-actions-setup.md).

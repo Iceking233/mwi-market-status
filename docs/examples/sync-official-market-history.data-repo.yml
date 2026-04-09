@@ -1,0 +1,49 @@
+name: Sync Official Market History
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-official-market-history
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@v4
+
+      - name: Checkout code repo
+        uses: actions/checkout@v4
+        with:
+          repository: Iceking233/mwi-market-status
+          path: source-repo
+          token: ${{ secrets.MWI_SYNC_REPO_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Sync official market archive into data repo docs
+        env:
+          MWI_OFFICIAL_MARKET_URL: ${{ vars.MWI_OFFICIAL_MARKET_URL }}
+        run: node source-repo/bakcend/sync-official-market-history.mjs --docs-dir ./docs
+
+      - name: Commit archive updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/history docs/market
+          if git diff --cached --quiet; then
+            echo "No archive changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: sync official market history"
+          git push

@@ -2,6 +2,17 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import {
+  DEFAULT_HOURLY_RETENTION_DAYS,
+  buildEmptyOfficialManifest,
+  compactHistoryRows,
+  toSafeFilename,
+  updateVariantManifestEntry
+} from "./history-compaction.mjs";
+import {
+  resolveDataDocsDir,
+  resolveOfficialHistoryOutDir
+} from "./data-repo-paths.mjs";
 
 const ALLOWED_SOURCES = new Set([
   null,
@@ -19,24 +30,29 @@ const ALLOWED_SOURCES = new Set([
 function parseArgs(argv) {
   const args = {
     inFile: "",
-    outDir: path.resolve("docs/history/official"),
-    sourceName: "browser_history_import"
+    docsDir: resolveDataDocsDir(),
+    outDir: "",
+    sourceName: "browser_history_import",
+    hourlyRetentionDays: DEFAULT_HOURLY_RETENTION_DAYS
   };
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--in") args.inFile = path.resolve(argv[++i]);
+    else if (arg === "--docs-dir") args.docsDir = path.resolve(argv[++i]);
     else if (arg === "--out-dir") args.outDir = path.resolve(argv[++i]);
     else if (arg === "--source-name") args.sourceName = argv[++i];
+    else if (arg === "--hourly-retention-days") args.hourlyRetentionDays = Math.max(0, Number(argv[++i]) || 0);
     else if (arg === "--help") {
       console.log(`Usage:
-  node bakcend/import-browser-history-export.mjs --in /path/to/mwi-market-history-export.json [--out-dir docs/history/official]
+  node bakcend/import-browser-history-export.mjs --in /path/to/mwi-market-history-export.json [--docs-dir ./docs] [--out-dir docs/history/official] [--hourly-retention-days 60]
 
 What it does:
   1. Reads a userscript-exported browser history JSON file.
   2. Groups rows by item and variant.
   3. Merges them into docs/history/official/items/*.json.
-  4. Rebuilds docs/history/official/manifest.json.`);
+  4. Rebuilds docs/history/official/manifest.json.
+  5. Compacts rows older than the retention window into daily points.`);
       process.exit(0);
     } else {
       throw new Error(`Unknown argument: ${arg}`);
@@ -47,14 +63,8 @@ What it does:
     throw new Error("Missing required argument: --in <path-to-export.json>");
   }
 
+  args.outDir = resolveOfficialHistoryOutDir(args);
   return args;
-}
-
-function toSafeFilename(value) {
-  return String(value)
-    .replace(/^\/+/, "")
-    .replace(/[\\/:%?&#=+ ]/g, "_")
-    .replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
 async function readJsonIfExists(filePath, fallback) {
@@ -137,11 +147,8 @@ async function main() {
   const inputPayload = JSON.parse(await fs.readFile(args.inFile, "utf8"));
   const exportRows = normalizeExportRows(inputPayload);
   const manifest = await readJsonIfExists(manifestPath, {
-    version: 1,
-    generatedAt: new Date().toISOString(),
-    sourceName: args.sourceName,
-    latestSnapshot: null,
-    items: {}
+    ...buildEmptyOfficialManifest(args.sourceName),
+    latestSnapshot: null
   });
 
   const grouped = new Map();
@@ -170,29 +177,29 @@ async function main() {
     });
 
     const mergedRows = mergeRows(existingShard.rows || [], rows);
-    if (!mergedRows.length) continue;
+    const compactedRows = compactHistoryRows(mergedRows, {
+      hourlyRetentionDays: args.hourlyRetentionDays
+    });
+    if (!compactedRows.length) continue;
 
     existingShard.version = 1;
     existingShard.source = existingShard.source || args.sourceName;
     existingShard.itemHrid = itemHrid;
     existingShard.variant = variant;
-    existingShard.rows = mergedRows;
-    existingShard.earliestTime = mergedRows[0].time;
-    existingShard.latestTime = mergedRows[mergedRows.length - 1].time;
+    existingShard.rows = compactedRows;
+    existingShard.earliestTime = compactedRows[0].time;
+    existingShard.latestTime = compactedRows[compactedRows.length - 1].time;
+    existingShard.hourlyRetentionDays = args.hourlyRetentionDays;
 
     await fs.writeFile(itemPath, `${JSON.stringify(existingShard)}\n`, "utf8");
 
     const itemEntry = manifest.items[itemHrid] || { variants: {} };
-    itemEntry.variants[String(variant)] = {
-      path: itemRelativePath,
-      rows: mergedRows.length,
-      earliestTime: existingShard.earliestTime,
-      latestTime: existingShard.latestTime,
-      maxDays: Math.max(
-        1,
-        Math.ceil((Number(existingShard.latestTime) - Number(existingShard.earliestTime)) / 86400) + 1
-      )
-    };
+    itemEntry.variants[String(variant)] = updateVariantManifestEntry(
+      itemEntry.variants[String(variant)],
+      compactedRows,
+      itemRelativePath,
+      args.hourlyRetentionDays
+    );
     manifest.items[itemHrid] = itemEntry;
     importedVariants += 1;
   }

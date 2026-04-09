@@ -5,3 +5,5 @@ __pycache__/
 *.sqlite
 .DS_Store
 backend/data/
+docs/history/
+docs/market/

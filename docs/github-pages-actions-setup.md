@@ -2,6 +2,9 @@
 
 This project is designed to use GitHub as the long-term storage and distribution layer.
 
+If you split code and data into separate repositories, keep this workflow in the data repo, not the code repo.
+You can start from the template at `docs/examples/sync-official-market-history.data-repo.yml`.
+
 ## What GitHub will do
 
 - GitHub Actions runs every 30 minutes.
@@ -12,12 +15,20 @@ This project is designed to use GitHub as the long-term storage and distribution
 
 ## What you need to do
 
-### 1. Push this repository to GitHub
+### 1. Push the data repository to GitHub
 
 Make sure the workflow file and sync script are included:
 
 - `.github/workflows/sync-official-market-history.yml`
 - `bakcend/sync-official-market-history.mjs`
+
+For a split repo setup, copy:
+
+- `docs/examples/sync-official-market-history.data-repo.yml`
+
+into the data repo as:
+
+- `.github/workflows/sync-official-market-history.yml`
 
 ### 2. Enable GitHub Actions
 
@@ -31,6 +42,10 @@ Open your repository on GitHub:
 Recommended setting:
 
 - Workflow permissions: `Read and write permissions`
+
+If the code repo is private, also create a fine-grained PAT with read access to that repo and save it in the data repo as:
+
+- `MWI_SYNC_REPO_TOKEN`
 
 ### 3. Enable GitHub Pages
 
@@ -48,6 +63,8 @@ After Pages is enabled, your public URLs will look like:
 
 - `https://<your-user>.github.io/<your-repo>/market/api.json`
 - `https://<your-user>.github.io/<your-repo>/market/history/official/manifest.json`
+
+If you use a dedicated data repo, `<your-repo>` should be that data repo, for example `mwi-market-data`.
 
 ## Optional repository variable
 

@@ -4,26 +4,33 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import {
+  resolveDataDocsDir,
+  resolveSqliteHistoryOutDir
+} from "./data-repo-paths.mjs";
 
 function parseArgs(argv) {
   const args = {
     dbUrl: "https://raw.githubusercontent.com/holychikenz/MWIApi/main/market.db",
-    outDir: path.resolve("docs/history/sqlite")
+    docsDir: resolveDataDocsDir(),
+    outDir: ""
   };
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--db-url") args.dbUrl = argv[++i];
+    else if (arg === "--docs-dir") args.docsDir = path.resolve(argv[++i]);
     else if (arg === "--out-dir") args.outDir = path.resolve(argv[++i]);
     else if (arg === "--help") {
       console.log(`Usage:
-  node bakcend/download-and-build-sqlite-history.mjs [--db-url <url>] [--out-dir docs/history/sqlite]`);
+  node bakcend/download-and-build-sqlite-history.mjs [--db-url <url>] [--docs-dir ./docs] [--out-dir docs/history/sqlite]`);
       process.exit(0);
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
   }
 
+  args.outDir = resolveSqliteHistoryOutDir(args);
   return args;
 }
 

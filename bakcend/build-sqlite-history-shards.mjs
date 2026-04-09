@@ -3,17 +3,23 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import {
+  resolveDataDocsDir,
+  resolveSqliteHistoryOutDir
+} from "./data-repo-paths.mjs";
 
 function parseArgs(argv) {
   const args = {
     db: "",
-    outDir: path.resolve("docs/history/sqlite"),
+    docsDir: resolveDataDocsDir(),
+    outDir: "",
     sourceName: "mwiapi_market_db"
   };
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--db") args.db = path.resolve(argv[++i]);
+    else if (arg === "--docs-dir") args.docsDir = path.resolve(argv[++i]);
     else if (arg === "--out-dir") args.outDir = path.resolve(argv[++i]);
     else if (arg === "--source-name") args.sourceName = argv[++i];
     else if (arg === "--help") {
@@ -28,12 +34,13 @@ function parseArgs(argv) {
     throw new Error("Missing required argument: --db <path-to-market.db>");
   }
 
+  args.outDir = resolveSqliteHistoryOutDir(args);
   return args;
 }
 
 function printHelp() {
   console.log(`Usage:
-  node bakcend/build-sqlite-history-shards.mjs --db /path/to/market.db [--out-dir docs/history/sqlite]
+  node bakcend/build-sqlite-history-shards.mjs --db /path/to/market.db [--docs-dir ./docs] [--out-dir docs/history/sqlite]
 
 What it does:
   1. Reads ask/bid history from the SQLite database.

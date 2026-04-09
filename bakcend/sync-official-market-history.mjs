@@ -2,53 +2,57 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import {
+  DEFAULT_HOURLY_RETENTION_DAYS,
+  buildEmptyOfficialManifest,
+  compactHistoryRows,
+  getOfficialHistoryPaths,
+  toSafeFilename,
+  updateVariantManifestEntry
+} from "./history-compaction.mjs";
+import {
+  resolveDataDocsDir,
+  resolveOfficialHistoryOutDir
+} from "./data-repo-paths.mjs";
 
 function parseArgs(argv) {
   const args = {
     sourceUrl: process.env.MWI_OFFICIAL_MARKET_URL || "https://www.milkywayidle.com/game_data/marketplace.json",
-    outDir: path.resolve("docs/history/official"),
-    sourceName: "official_marketplace_json"
+    docsDir: resolveDataDocsDir(),
+    outDir: "",
+    sourceName: "official_marketplace_json",
+    hourlyRetentionDays: DEFAULT_HOURLY_RETENTION_DAYS
   };
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--source-url") args.sourceUrl = argv[++i];
+    else if (arg === "--docs-dir") args.docsDir = path.resolve(argv[++i]);
     else if (arg === "--out-dir") args.outDir = path.resolve(argv[++i]);
     else if (arg === "--source-name") args.sourceName = argv[++i];
+    else if (arg === "--hourly-retention-days") args.hourlyRetentionDays = Math.max(0, Number(argv[++i]) || 0);
     else if (arg === "--help") {
       console.log(`Usage:
-  node bakcend/sync-official-market-history.mjs [--source-url <url>] [--out-dir docs/history/official]
+  node bakcend/sync-official-market-history.mjs [--source-url <url>] [--docs-dir ./docs] [--out-dir docs/history/official] [--hourly-retention-days 60]
 
 What it does:
   1. Downloads the latest market snapshot JSON.
   2. Stores the raw snapshot in a dated archive path.
-  3. Updates latest.json plus per-item/per-variant history shards and manifest.json.`);
+  3. Updates latest.json plus per-item/per-variant history shards and manifest.json.
+  4. Compacts rows older than the retention window into daily points.
+
+Notes:
+  - If --out-dir is omitted, output defaults to <docs-dir>/history/official.
+  - MWI_MARKET_DATA_DOCS_DIR can also override the docs root.`);
       process.exit(0);
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
   }
 
+  args.outDir = resolveOfficialHistoryOutDir(args);
   return args;
 }
-
-function toSafeFilename(value) {
-  return String(value)
-    .replace(/^\/+/, "")
-    .replace(/[\\/:%?&#=+ ]/g, "_")
-    .replace(/[^a-zA-Z0-9._-]/g, "_");
-}
-
-function createEmptyManifest(sourceName) {
-  return {
-    version: 1,
-    generatedAt: new Date().toISOString(),
-    sourceName,
-    latestSnapshot: null,
-    items: {}
-  };
-}
-
 async function readJsonIfExists(filePath, fallback) {
   try {
     return JSON.parse(await fs.readFile(filePath, "utf8"));
@@ -174,15 +178,17 @@ function buildPublicMarketManifest(manifest) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const snapshotsDir = path.join(args.outDir, "snapshots");
-  const itemsDir = path.join(args.outDir, "items");
-  const latestPath = path.join(args.outDir, "latest.json");
-  const manifestPath = path.join(args.outDir, "manifest.json");
-  const publicMarketDir = path.resolve("docs/market");
-  const publicHistoryDir = path.join(publicMarketDir, "history", "official");
-  const publicApiPath = path.join(publicMarketDir, "api.json");
-  const publicManifestPath = path.join(publicMarketDir, "manifest.json");
-  const publicHistoryManifestPath = path.join(publicHistoryDir, "manifest.json");
+  const {
+    snapshotsDir,
+    itemsDir,
+    latestPath,
+    manifestPath,
+    publicMarketDir,
+    publicHistoryDir,
+    publicApiPath,
+    publicManifestPath,
+    publicHistoryManifestPath
+  } = getOfficialHistoryPaths(args.outDir);
 
   await fs.mkdir(snapshotsDir, { recursive: true });
   await fs.mkdir(itemsDir, { recursive: true });
@@ -199,7 +205,7 @@ async function main() {
 
   const snapshotPayload = await response.json();
   const snapshot = normalizeSnapshot(snapshotPayload, response, args.sourceUrl);
-  const manifest = await readJsonIfExists(manifestPath, createEmptyManifest(args.sourceName));
+  const manifest = await readJsonIfExists(manifestPath, buildEmptyOfficialManifest(args.sourceName));
 
   const isSameSnapshot = Number(manifest?.latestSnapshot?.timestamp || 0) === Number(snapshot.timestamp || 0);
 
@@ -244,28 +250,29 @@ async function main() {
 
     const rows = Array.isArray(existingShard.rows) ? existingShard.rows : [];
     mergeRow(rows, entry.row);
+    const compactedRows = compactHistoryRows(rows, {
+      nowTime: snapshot.timestamp,
+      hourlyRetentionDays: args.hourlyRetentionDays
+    });
 
     existingShard.version = 1;
     existingShard.source = args.sourceName;
     existingShard.itemHrid = entry.itemHrid;
     existingShard.variant = entry.variant;
-    existingShard.rows = rows;
-    existingShard.earliestTime = rows[0]?.time ?? entry.row.time;
-    existingShard.latestTime = rows[rows.length - 1]?.time ?? entry.row.time;
+    existingShard.rows = compactedRows;
+    existingShard.earliestTime = compactedRows[0]?.time ?? entry.row.time;
+    existingShard.latestTime = compactedRows[compactedRows.length - 1]?.time ?? entry.row.time;
+    existingShard.hourlyRetentionDays = args.hourlyRetentionDays;
 
     await fs.writeFile(itemPath, `${JSON.stringify(existingShard)}\n`, "utf8");
 
     const itemEntry = manifest.items[entry.itemHrid] || { variants: {} };
-    itemEntry.variants[String(entry.variant)] = {
-      path: itemRelativePath,
-      rows: rows.length,
-      earliestTime: existingShard.earliestTime,
-      latestTime: existingShard.latestTime,
-      maxDays: Math.max(
-        1,
-        Math.ceil((Number(existingShard.latestTime) - Number(existingShard.earliestTime)) / 86400) + 1
-      )
-    };
+    itemEntry.variants[String(entry.variant)] = updateVariantManifestEntry(
+      itemEntry.variants[String(entry.variant)],
+      compactedRows,
+      itemRelativePath,
+      args.hourlyRetentionDays
+    );
     manifest.items[entry.itemHrid] = itemEntry;
     touchedVariants += 1;
   }

@@ -2383,9 +2383,14 @@
   }
   /*实时市场模块*/
   const HOST = "https://mooket.qi-e.top";
-  const MWIAPI_URL = "https://iceking233.github.io/mwi-market-status/market/api.json";
-  const OFFICIAL_HISTORY_MANIFEST_URL = "https://iceking233.github.io/mwi-market-status/market/history/official/manifest.json";
-  const SQLITE_HISTORY_MANIFEST_URL = "https://iceking233.github.io/mwi-market-status/history/sqlite/manifest.json";
+  const PRIMARY_DATA_PAGES_BASE = "https://iceking233.github.io/mwi-market-data";
+  const LEGACY_DATA_PAGES_BASE = "https://iceking233.github.io/mwi-market-status";
+  const MWIAPI_URL = `${PRIMARY_DATA_PAGES_BASE}/market/api.json`;
+  const OFFICIAL_HISTORY_MANIFEST_URL = `${PRIMARY_DATA_PAGES_BASE}/market/history/official/manifest.json`;
+  const SQLITE_HISTORY_MANIFEST_URL = `${PRIMARY_DATA_PAGES_BASE}/history/sqlite/manifest.json`;
+  const LEGACY_MWIAPI_URL = `${LEGACY_DATA_PAGES_BASE}/market/api.json`;
+  const LEGACY_OFFICIAL_HISTORY_MANIFEST_URL = `${LEGACY_DATA_PAGES_BASE}/market/history/official/manifest.json`;
+  const LEGACY_SQLITE_HISTORY_MANIFEST_URL = `${LEGACY_DATA_PAGES_BASE}/history/sqlite/manifest.json`;
   const FALLBACK_MARKET_API_URL = `${HOST}/market/api.json`;
   const LEGACY_HISTORY_URL = `${HOST}/market/item/history`;
   const Q7_HISTORY_URL = "https://q7.nainai.eu.org/api/market/histories";
@@ -2397,16 +2402,33 @@
   const officialHistoryManifestState = {
     value: null,
     fetchedAt: 0,
-    inflight: null
+    inflight: null,
+    baseUrl: OFFICIAL_HISTORY_MANIFEST_URL
   };
   const sqliteHistoryManifestState = {
     value: null,
     fetchedAt: 0,
-    inflight: null
+    inflight: null,
+    baseUrl: SQLITE_HISTORY_MANIFEST_URL
   };
   const historyDebugState = {
     lastChartSignature: null
   };
+  async function fetchJsonFromCandidates(urls, options = {}, validate = null) {
+    let lastError = null;
+    for (const url of urls.filter(Boolean)) {
+      try {
+        const response = await fetch(url, options);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        if (validate) validate(payload);
+        return { url, payload };
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError || new Error("No reachable JSON endpoint");
+  }
   function setSourceNotice(type, detail = null) {
     void type;
     void detail;
@@ -2806,14 +2828,22 @@
       return officialHistoryManifestState.inflight;
     }
 
-    officialHistoryManifestState.inflight = fetch(OFFICIAL_HISTORY_MANIFEST_URL, { signal })
-      .then(response => {
-        if (!response.ok) throw new Error(`Official history manifest HTTP ${response.status}`);
-        return response.json();
-      })
-      .then(payload => {
+    officialHistoryManifestState.inflight = fetchJsonFromCandidates(
+      [
+        OFFICIAL_HISTORY_MANIFEST_URL,
+        LEGACY_OFFICIAL_HISTORY_MANIFEST_URL
+      ],
+      { signal },
+      payload => {
+        if (!Object.keys(payload?.items || {}).length) {
+          throw new Error("Official history manifest items empty");
+        }
+      }
+    )
+      .then(({ url, payload }) => {
         officialHistoryManifestState.value = payload;
         officialHistoryManifestState.fetchedAt = Date.now();
+        officialHistoryManifestState.baseUrl = url;
         return payload;
       })
       .finally(() => {
@@ -2842,14 +2872,22 @@
       return sqliteHistoryManifestState.inflight;
     }
 
-    sqliteHistoryManifestState.inflight = fetch(SQLITE_HISTORY_MANIFEST_URL, { signal })
-      .then(response => {
-        if (!response.ok) throw new Error(`SQLite history manifest HTTP ${response.status}`);
-        return response.json();
-      })
-      .then(payload => {
+    sqliteHistoryManifestState.inflight = fetchJsonFromCandidates(
+      [
+        SQLITE_HISTORY_MANIFEST_URL,
+        LEGACY_SQLITE_HISTORY_MANIFEST_URL
+      ],
+      { signal },
+      payload => {
+        if (!Object.keys(payload?.items || {}).length) {
+          throw new Error("SQLite history manifest items empty");
+        }
+      }
+    )
+      .then(({ url, payload }) => {
         sqliteHistoryManifestState.value = payload;
         sqliteHistoryManifestState.fetchedAt = Date.now();
+        sqliteHistoryManifestState.baseUrl = url;
         return payload;
       })
       .finally(() => {
@@ -3006,7 +3044,7 @@
           resolveOfficialHistoryManifestEntry(manifest, sampleItemName, 0) ||
           Object.values(manifest?.items || {})[0]?.variants?.["0"];
         if (entry?.path) {
-          const shardUrl = toAbsoluteUrl(entry.path, OFFICIAL_HISTORY_MANIFEST_URL);
+          const shardUrl = toAbsoluteUrl(entry.path, officialHistoryManifestState.baseUrl || OFFICIAL_HISTORY_MANIFEST_URL);
           officialShard = await probeJsonEndpoint(
             "official_history_shard",
             shardUrl,
@@ -3048,7 +3086,7 @@
           resolveSqliteHistoryManifestEntry(manifest, sampleItemName) ||
           Object.values(manifest?.items || {})[0];
         if (entry?.path) {
-          const shardUrl = toAbsoluteUrl(entry.path, SQLITE_HISTORY_MANIFEST_URL);
+          const shardUrl = toAbsoluteUrl(entry.path, sqliteHistoryManifestState.baseUrl || SQLITE_HISTORY_MANIFEST_URL);
           sqliteShard = await probeJsonEndpoint(
             "sqlite_shard",
             shardUrl,
@@ -3181,6 +3219,10 @@
         {
           label: "github_pages",
           url: MWIAPI_URL
+        },
+        {
+          label: "legacy_github_pages",
+          url: LEGACY_MWIAPI_URL
         },
         {
           label: "legacy_market_api",
@@ -5011,7 +5053,10 @@
       }
 
       const requestPromise = (async () => {
-        const response = await fetch(toAbsoluteUrl(entry.path, OFFICIAL_HISTORY_MANIFEST_URL), { signal });
+        const response = await fetch(
+          toAbsoluteUrl(entry.path, officialHistoryManifestState.baseUrl || OFFICIAL_HISTORY_MANIFEST_URL),
+          { signal }
+        );
         if (!response.ok) {
           throw new Error(`Official history shard HTTP ${response.status}`);
         }
@@ -5056,7 +5101,10 @@
       }
 
       const requestPromise = (async () => {
-        const response = await fetch(toAbsoluteUrl(entry.path, SQLITE_HISTORY_MANIFEST_URL), { signal });
+        const response = await fetch(
+          toAbsoluteUrl(entry.path, sqliteHistoryManifestState.baseUrl || SQLITE_HISTORY_MANIFEST_URL),
+          { signal }
+        );
         if (!response.ok) {
           throw new Error(`SQLite history shard HTTP ${response.status}`);
         }

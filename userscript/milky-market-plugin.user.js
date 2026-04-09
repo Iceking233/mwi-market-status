@@ -4847,15 +4847,11 @@
             <div style="height:1px;background:rgba(255,255,255,0.08);margin:6px 0 2px;"></div>
             <div style="display:flex;align-items:center;gap:8px;">
               <span style="width:10px;height:10px;border-radius:2px;background:#ef4444;box-shadow:0 0 0 2px rgba(255,255,255,0.12) inset;"></span>
-              <span style="color:#d7dde6;">${mwi.isZh ? '卖一成交(估)' : 'Est. Ask'}: ${showNumber(estimate.askVolume)}</span>
+              <span style="color:#d7dde6;">${mwi.isZh ? '卖一成交(估)' : 'Est. Ask'}: ${showNumber(estimate.askVolume)} ${mwi.isZh ? `(区间 ${showNumber(estimate.askMin)} - ${showNumber(estimate.askMax)})` : `(Range ${showNumber(estimate.askMin)} - ${showNumber(estimate.askMax)})`}</span>
             </div>
             <div style="display:flex;align-items:center;gap:8px;">
               <span style="width:10px;height:10px;border-radius:2px;background:#22c55e;box-shadow:0 0 0 2px rgba(255,255,255,0.12) inset;"></span>
-              <span style="color:#d7dde6;">${mwi.isZh ? '买一成交(估)' : 'Est. Bid'}: ${showNumber(estimate.bidVolume)}</span>
-            </div>
-            <div style="display:flex;align-items:center;gap:8px;">
-              <span style="width:10px;height:10px;border-radius:2px;background:rgba(255,255,255,0.20);box-shadow:0 0 0 2px rgba(255,255,255,0.12) inset;"></span>
-              <span style="color:#d7dde6;">${mwi.isZh ? '估算区间' : 'Range'}: ${mwi.isZh ? '卖一' : 'Ask'} ${showNumber(estimate.askMin)}-${showNumber(estimate.askMax)} / ${mwi.isZh ? '买一' : 'Bid'} ${showNumber(estimate.bidMin)}-${showNumber(estimate.bidMax)}</span>
+              <span style="color:#d7dde6;">${mwi.isZh ? '买一成交(估)' : 'Est. Bid'}: ${showNumber(estimate.bidVolume)} ${mwi.isZh ? `(区间 ${showNumber(estimate.bidMin)} - ${showNumber(estimate.bidMax)})` : `(Range ${showNumber(estimate.bidMin)} - ${showNumber(estimate.bidMax)})`}</span>
             </div>
             <div style="display:flex;align-items:center;gap:8px;">
               <span style="width:10px;height:10px;border-radius:2px;background:${confidenceInfo.color};box-shadow:0 0 0 2px rgba(255,255,255,0.12) inset;"></span>
